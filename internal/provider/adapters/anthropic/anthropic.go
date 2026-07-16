@@ -28,8 +28,11 @@ import (
 // ProviderName is the stable registry key for this provider.
 const ProviderName = "anthropic"
 
-// Compile-time assertion that Provider satisfies the contract.
-var _ provider.LLMProvider = (*Provider)(nil)
+// Compile-time assertions that Provider satisfies the contracts.
+var (
+	_ provider.LLMProvider = (*Provider)(nil)
+	_ provider.Lifecycle   = (*Provider)(nil)
+)
 
 // Config configures the Anthropic adapter. Credentials are injected, never
 // hardcoded.
@@ -46,9 +49,12 @@ type Config struct {
 	Models []provider.ModelInfo
 	// Retry configures the retry policy for Chat. Zero uses defaults.
 	Retry retry.Policy
-	// HTTPClient injects a custom HTTP client (e.g. for tests). Nil uses the
-	// SDK default.
+	// HTTPClient injects a custom HTTP client (e.g. for tests). Nil creates a
+	// dedicated client owned by the provider.
 	HTTPClient *http.Client
+	// StrictModels, when true, rejects a request whose explicit model is not in
+	// the provider's catalog with ErrUnsupportedModel, before any dispatch.
+	StrictModels bool
 	// now injects a clock for deterministic response timestamps in tests. Nil
 	// uses time.Now.
 	now func() time.Time
@@ -58,10 +64,12 @@ type Config struct {
 type Provider struct {
 	name         string
 	client       ant.Client
+	httpClient   *http.Client
 	models       []provider.ModelInfo
 	defaultModel string
 	retry        retry.Policy
 	timeout      time.Duration
+	strictModels bool
 	now          func() time.Time
 }
 
@@ -87,28 +95,45 @@ func New(cfg Config) *Provider {
 		now = time.Now
 	}
 
+	// The provider owns an HTTP client so it can release idle connections on
+	// Shutdown. Per-request deadlines are applied via context.
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{}
+	}
+
 	// WithMaxRetries(0) disables the SDK's own retry loop so our retry helper is
 	// the single source of retry behavior.
 	opts := []option.RequestOption{
 		option.WithAPIKey(cfg.APIKey),
 		option.WithMaxRetries(0),
+		option.WithHTTPClient(httpClient),
 	}
 	if cfg.BaseURL != "" {
 		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
-	}
-	if cfg.HTTPClient != nil {
-		opts = append(opts, option.WithHTTPClient(cfg.HTTPClient))
 	}
 
 	return &Provider{
 		name:         name,
 		client:       ant.NewClient(opts...),
+		httpClient:   httpClient,
 		models:       models,
 		defaultModel: defaultChatModel(models),
 		retry:        cfg.Retry,
 		timeout:      timeout,
+		strictModels: cfg.StrictModels,
 		now:          now,
 	}
+}
+
+// Initialize satisfies provider.Lifecycle. The Anthropic adapter holds no
+// resources that require eager setup, so this is a no-op.
+func (p *Provider) Initialize(ctx context.Context) error { return nil }
+
+// Shutdown satisfies provider.Lifecycle by releasing idle HTTP connections.
+func (p *Provider) Shutdown(ctx context.Context) error {
+	p.httpClient.CloseIdleConnections()
+	return nil
 }
 
 // Name returns the provider's registry name.
@@ -119,6 +144,9 @@ func (p *Provider) Name() string { return p.name }
 func (p *Provider) Chat(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error) {
 	if err := req.Validate(); err != nil {
 		return provider.ChatResponse{}, provider.NewError(p.name, "chat", err)
+	}
+	if p.strictModels && req.Model != "" && !provider.ModelSupported(p.models, req.Model, provider.CapabilityChat) {
+		return provider.ChatResponse{}, provider.NewErrorf(p.name, "chat", provider.ErrUnsupportedModel, "model %q is not supported", req.Model)
 	}
 
 	params := toMessageParams(req, p.resolveModel(req.Model))

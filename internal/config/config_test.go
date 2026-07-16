@@ -86,6 +86,34 @@ func TestConfig_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "valid https base url",
+			mutate: func(c *Config) {
+				c.Providers = []ProviderConfig{{Name: "openai", BaseURL: "https://api.example.com/v1"}}
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid base url - no scheme",
+			mutate: func(c *Config) {
+				c.Providers = []ProviderConfig{{Name: "openai", BaseURL: "api.example.com"}}
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid base url - bad scheme",
+			mutate: func(c *Config) {
+				c.Providers = []ProviderConfig{{Name: "openai", BaseURL: "ftp://api.example.com"}}
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid base url - garbage",
+			mutate: func(c *Config) {
+				c.Providers = []ProviderConfig{{Name: "openai", BaseURL: "not a url"}}
+			},
+			wantErr: true,
+		},
+		{
 			name:    "default provider without any provider list is allowed",
 			mutate:  func(c *Config) { c.DefaultProvider = "openai" },
 			wantErr: false,

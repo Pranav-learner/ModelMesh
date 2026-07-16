@@ -1,15 +1,16 @@
 // Command gateway is the ModelMesh entrypoint.
 //
 // Phase 1 has no HTTP server, routing, or cache — only the Provider Layer. This
-// entrypoint assembles the provider layer and exercises the deliverable path:
+// entrypoint runs the complete startup flow and exercises the deliverable path:
 //
-//	Application -> Provider Manager -> Provider Registry -> LLMProvider
-//	                                                          ├── OpenAIProvider   -> OpenAI SDK
-//	                                                          └── AnthropicProvider -> Anthropic SDK
+//	Application -> Bootstrap -> Factory -> Registry -> Manager -> LLMProvider
+//	                                                               ├── OpenAIProvider   -> OpenAI SDK
+//	                                                               └── AnthropicProvider -> Anthropic SDK
 //
 // Real providers are configured from environment credentials (OPENAI_API_KEY,
-// ANTHROPIC_API_KEY). When none are present, a mock provider is registered so
-// the binary still demonstrates the wiring fully offline.
+// ANTHROPIC_API_KEY) and built by the factory. When none are present, a mock
+// provider is registered so the binary still demonstrates the wiring fully
+// offline.
 package main
 
 import (
@@ -36,12 +37,7 @@ func main() {
 func run() error {
 	log := logger.New(logger.LevelInfo)
 
-	cfg, providers, err := loadProviders(log)
-	if err != nil {
-		return err
-	}
-
-	app, err := bootstrap.New(cfg, log, providers...)
+	app, err := initApp(log)
 	if err != nil {
 		return err
 	}
@@ -49,14 +45,18 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), app.Config.RequestTimeout)
 	defer cancel()
 
+	if err := app.Initialize(ctx); err != nil {
+		return err
+	}
+	defer func() { _ = app.Shutdown(context.Background()) }()
+
 	// Exercise the deliverable path against the default provider.
-	p, err := app.Manager.Default()
+	p, err := app.Manager.DefaultProvider()
 	if err != nil {
 		return err
 	}
 
-	health, err := p.HealthCheck(ctx)
-	if err != nil {
+	if health, err := p.HealthCheck(ctx); err != nil {
 		log.Warn("health check could not complete", logger.String("provider", p.Name()), logger.Err(err))
 	} else {
 		log.Info("provider health",
@@ -67,9 +67,7 @@ func run() error {
 	}
 
 	resp, err := p.Chat(ctx, provider.ChatRequest{
-		Messages: []provider.ChatMessage{
-			{Role: provider.RoleUser, Content: "hello, ModelMesh"},
-		},
+		Messages: []provider.ChatMessage{{Role: provider.RoleUser, Content: "hello, ModelMesh"}},
 	})
 	if err != nil {
 		log.Warn("chat call failed", logger.String("provider", p.Name()), logger.Err(err))
@@ -84,10 +82,10 @@ func run() error {
 	return nil
 }
 
-// loadProviders builds the configuration and provider set from the environment.
-// If no provider credentials are present, it falls back to a mock provider so
-// the gateway remains runnable offline.
-func loadProviders(log logger.Logger) (config.Config, []provider.LLMProvider, error) {
+// initApp builds the App from environment configuration. If provider credentials
+// are present it runs the full factory-based Bootstrap; otherwise it falls back
+// to a mock provider via New so the gateway remains runnable offline.
+func initApp(log logger.Logger) (*bootstrap.App, error) {
 	cfg := config.DefaultConfig()
 
 	var pcs []config.ProviderConfig
@@ -101,15 +99,10 @@ func loadProviders(log logger.Logger) (config.Config, []provider.LLMProvider, er
 	if len(pcs) == 0 {
 		log.Info("no provider credentials found; using mock provider")
 		cfg.DefaultProvider = "mock"
-		return cfg, []provider.LLMProvider{mock.New(mock.WithName("mock"))}, nil
+		return bootstrap.New(cfg, log, mock.New(mock.WithName("mock")))
 	}
 
 	cfg.Providers = pcs
 	cfg.DefaultProvider = pcs[0].Name
-
-	providers, err := bootstrap.ProvidersFromConfig(cfg)
-	if err != nil {
-		return config.Config{}, nil, err
-	}
-	return cfg, providers, nil
+	return bootstrap.Bootstrap(cfg, log)
 }

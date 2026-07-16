@@ -107,3 +107,48 @@ func (m *Manager) Describe(ctx context.Context, name string) (ProviderInfo, erro
 	}
 	return DescribeProvider(ctx, p)
 }
+
+// -----------------------------------------------------------------------------
+// Discovery API
+//
+// The following methods form the discovery surface that later phases (starting
+// with the Routing Engine) use to enumerate providers, resolve them, and inspect
+// their models and capabilities. GetProvider and DefaultProvider are intent-
+// revealing aliases of Provider and Default.
+// -----------------------------------------------------------------------------
+
+// ListProviders returns the sorted names of all registered providers.
+func (m *Manager) ListProviders() []string {
+	return m.registry.Names()
+}
+
+// GetProvider resolves a provider by name. It is an alias of Provider, named to
+// match the discovery vocabulary.
+func (m *Manager) GetProvider(name string) (LLMProvider, error) {
+	return m.Provider(name)
+}
+
+// DefaultProvider returns the configured default provider. It is an alias of
+// Default.
+func (m *Manager) DefaultProvider() (LLMProvider, error) {
+	return m.Default()
+}
+
+// ListModels returns the catalog of models advertised by the named provider.
+func (m *Manager) ListModels(ctx context.Context, name string) ([]ModelInfo, error) {
+	p, err := m.Provider(name)
+	if err != nil {
+		return nil, err
+	}
+	return p.Models(ctx)
+}
+
+// ProviderCapabilities returns the coarse capability summary for the named
+// provider.
+func (m *Manager) ProviderCapabilities(ctx context.Context, name string) (ProviderCapabilities, error) {
+	info, err := m.Describe(ctx, name)
+	if err != nil {
+		return ProviderCapabilities{}, err
+	}
+	return info.Capabilities, nil
+}

@@ -27,8 +27,11 @@ import (
 // ProviderName is the stable registry key for this provider.
 const ProviderName = "openai"
 
-// Compile-time assertion that Provider satisfies the contract.
-var _ provider.LLMProvider = (*Provider)(nil)
+// Compile-time assertions that Provider satisfies the contracts.
+var (
+	_ provider.LLMProvider = (*Provider)(nil)
+	_ provider.Lifecycle   = (*Provider)(nil)
+)
 
 // Config configures the OpenAI adapter. Credentials are injected, never
 // hardcoded. All fields are optional except APIKey for real usage; tests supply
@@ -46,19 +49,25 @@ type Config struct {
 	Models []provider.ModelInfo
 	// Retry configures the retry policy for Chat/Embeddings. Zero uses defaults.
 	Retry retry.Policy
-	// HTTPClient injects a custom HTTP client (e.g. for tests). Nil uses the
-	// SDK default.
+	// HTTPClient injects a custom HTTP client (e.g. for tests). Nil creates a
+	// dedicated client owned by the provider.
 	HTTPClient *http.Client
+	// StrictModels, when true, rejects a request whose explicit model is not in
+	// the provider's catalog with ErrUnsupportedModel, before any dispatch.
+	// Default (false) forwards any model and lets the upstream decide.
+	StrictModels bool
 }
 
 // Provider is the OpenAI implementation of provider.LLMProvider.
 type Provider struct {
 	name         string
 	client       oai.Client
+	httpClient   *http.Client
 	models       []provider.ModelInfo
 	defaultModel string
 	retry        retry.Policy
 	timeout      time.Duration
+	strictModels bool
 }
 
 // New constructs an OpenAI provider from cfg.
@@ -78,27 +87,46 @@ func New(cfg Config) *Provider {
 		timeout = 30 * time.Second
 	}
 
+	// The provider owns an HTTP client so it can release idle connections on
+	// Shutdown. Per-request deadlines are applied via context, so the client
+	// itself carries no timeout.
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{}
+	}
+
 	// Build SDK options. Critically, WithMaxRetries(0) disables the SDK's own
 	// retry loop so that our retry helper is the single source of retry behavior.
 	opts := []option.RequestOption{
 		option.WithAPIKey(cfg.APIKey),
 		option.WithMaxRetries(0),
+		option.WithHTTPClient(httpClient),
 	}
 	if cfg.BaseURL != "" {
 		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
-	}
-	if cfg.HTTPClient != nil {
-		opts = append(opts, option.WithHTTPClient(cfg.HTTPClient))
 	}
 
 	return &Provider{
 		name:         name,
 		client:       oai.NewClient(opts...),
+		httpClient:   httpClient,
 		models:       models,
 		defaultModel: defaultChatModel(models),
 		retry:        cfg.Retry,
 		timeout:      timeout,
+		strictModels: cfg.StrictModels,
 	}
+}
+
+// Initialize satisfies provider.Lifecycle. The OpenAI adapter holds no resources
+// that require eager setup, so this is a no-op that simply honors the contract.
+func (p *Provider) Initialize(ctx context.Context) error { return nil }
+
+// Shutdown satisfies provider.Lifecycle by releasing idle HTTP connections held
+// by the provider's client.
+func (p *Provider) Shutdown(ctx context.Context) error {
+	p.httpClient.CloseIdleConnections()
+	return nil
 }
 
 // Name returns the provider's registry name.
@@ -109,6 +137,9 @@ func (p *Provider) Name() string { return p.name }
 func (p *Provider) Chat(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error) {
 	if err := req.Validate(); err != nil {
 		return provider.ChatResponse{}, provider.NewError(p.name, "chat", err)
+	}
+	if err := p.ensureModelSupported("chat", req.Model, provider.CapabilityChat); err != nil {
+		return provider.ChatResponse{}, err
 	}
 
 	params := toChatParams(req, p.resolveModel(req.Model, provider.CapabilityChat))
@@ -133,6 +164,9 @@ func (p *Provider) Chat(ctx context.Context, req provider.ChatRequest) (provider
 func (p *Provider) Embeddings(ctx context.Context, req provider.EmbeddingRequest) (provider.EmbeddingResponse, error) {
 	if err := req.Validate(); err != nil {
 		return provider.EmbeddingResponse{}, provider.NewError(p.name, "embeddings", err)
+	}
+	if err := p.ensureModelSupported("embeddings", req.Model, provider.CapabilityEmbeddings); err != nil {
+		return provider.EmbeddingResponse{}, err
 	}
 
 	params := toEmbeddingParams(req, p.resolveModel(req.Model, provider.CapabilityEmbeddings))
@@ -217,6 +251,19 @@ func (p *Provider) translate(op string, err error) error {
 		return adaptererr.FromStatus(p.name, op, apiErr.StatusCode, apiErr.Message)
 	}
 	return adaptererr.Unexpected(p.name, op, err)
+}
+
+// ensureModelSupported enforces optional strict model validation: when enabled
+// and an explicit model is requested, it must exist in the catalog with the
+// required capability, else ErrUnsupportedModel is returned before dispatch.
+func (p *Provider) ensureModelSupported(op, model string, capability provider.Capability) error {
+	if !p.strictModels || model == "" {
+		return nil
+	}
+	if !provider.ModelSupported(p.models, model, capability) {
+		return provider.NewErrorf(p.name, op, provider.ErrUnsupportedModel, "model %q is not supported", model)
+	}
+	return nil
 }
 
 // resolveModel returns the requested model, or the provider's default model for

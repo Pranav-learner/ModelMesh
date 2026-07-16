@@ -10,13 +10,17 @@ package mock
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/symbiotes/modelmesh/internal/provider"
 )
 
-// Compile-time assertion that Provider satisfies the LLMProvider contract.
-var _ provider.LLMProvider = (*Provider)(nil)
+// Compile-time assertions that Provider satisfies the contracts.
+var (
+	_ provider.LLMProvider = (*Provider)(nil)
+	_ provider.Lifecycle   = (*Provider)(nil)
+)
 
 // Provider is a deterministic, in-memory LLMProvider. The zero value is not
 // usable; construct with New.
@@ -35,6 +39,12 @@ type Provider struct {
 
 	// now allows tests to make timestamps deterministic. Defaults to time.Now.
 	now func() time.Time
+
+	// initErr, when set, is returned by Initialize to simulate a lifecycle
+	// failure. Lifecycle call counts are tracked for assertions.
+	initErr       error
+	initCalls     atomic.Int32
+	shutdownCalls atomic.Int32
 }
 
 // Option configures a Provider.
@@ -82,6 +92,11 @@ func WithClock(now func() time.Time) Option {
 	return func(p *Provider) { p.now = now }
 }
 
+// WithInitError makes Initialize return err, to exercise lifecycle failure paths.
+func WithInitError(err error) Option {
+	return func(p *Provider) { p.initErr = err }
+}
+
 // New constructs a mock Provider with sensible, deterministic defaults.
 func New(opts ...Option) *Provider {
 	p := &Provider{
@@ -110,6 +125,25 @@ func New(opts ...Option) *Provider {
 
 // Name returns the provider's configured name.
 func (p *Provider) Name() string { return p.name }
+
+// Initialize satisfies provider.Lifecycle, recording the call and returning the
+// configured init error (nil by default).
+func (p *Provider) Initialize(ctx context.Context) error {
+	p.initCalls.Add(1)
+	return p.initErr
+}
+
+// Shutdown satisfies provider.Lifecycle, recording the call.
+func (p *Provider) Shutdown(ctx context.Context) error {
+	p.shutdownCalls.Add(1)
+	return nil
+}
+
+// InitializeCalls reports how many times Initialize has been called.
+func (p *Provider) InitializeCalls() int { return int(p.initCalls.Load()) }
+
+// ShutdownCalls reports how many times Shutdown has been called.
+func (p *Provider) ShutdownCalls() int { return int(p.shutdownCalls.Load()) }
 
 // Chat returns a deterministic completion that echoes the last user message,
 // unless overridden by WithChatFunc or short-circuited by WithError.

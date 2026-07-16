@@ -8,6 +8,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 )
 
@@ -57,6 +58,26 @@ func (p ProviderConfig) ResolvedTimeout(global time.Duration) time.Duration {
 		return p.Timeout
 	}
 	return global
+}
+
+// Validate checks a single provider's configuration for structural validity.
+// Provider-specific requirements (such as whether an API key is mandatory) are
+// enforced by the provider's factory builder, not here, so that credential-less
+// providers (e.g. a local Ollama) remain valid at this layer.
+func (p ProviderConfig) Validate() error {
+	if p.Name == "" {
+		return fmt.Errorf("%w: provider name must not be empty", ErrInvalidConfig)
+	}
+	if p.Timeout < 0 {
+		return fmt.Errorf("%w: provider %q timeout must not be negative", ErrInvalidConfig, p.Name)
+	}
+	if p.BaseURL != "" {
+		u, err := url.Parse(p.BaseURL)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return fmt.Errorf("%w: provider %q base_url %q must be a valid http(s) URL", ErrInvalidConfig, p.Name, p.BaseURL)
+		}
+	}
+	return nil
 }
 
 // Config is the root configuration for ModelMesh. Only the fields relevant to
@@ -128,16 +149,13 @@ func (c Config) Validate() error {
 
 	seen := make(map[string]struct{}, len(c.Providers))
 	for i, p := range c.Providers {
-		if p.Name == "" {
-			return fmt.Errorf("%w: providers[%d].name must not be empty", ErrInvalidConfig, i)
+		if err := p.Validate(); err != nil {
+			return fmt.Errorf("providers[%d]: %w", i, err)
 		}
 		if _, dup := seen[p.Name]; dup {
 			return fmt.Errorf("%w: providers[%d].name %q is duplicated", ErrInvalidConfig, i, p.Name)
 		}
 		seen[p.Name] = struct{}{}
-		if p.Timeout < 0 {
-			return fmt.Errorf("%w: providers[%d].timeout must not be negative", ErrInvalidConfig, i)
-		}
 	}
 
 	// A configured DefaultProvider, if any, should refer to a configured provider

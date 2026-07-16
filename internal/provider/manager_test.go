@@ -137,3 +137,41 @@ func TestManager_DescribeUnknownProvider(t *testing.T) {
 		t.Fatalf("Describe(nope) = %v, want ErrProviderNotFound", err)
 	}
 }
+
+func TestManager_DiscoveryAPI(t *testing.T) {
+	m := newManager(t, "openai",
+		mock.New(mock.WithName("openai"), mock.WithModels(
+			provider.ModelInfo{ID: "gpt", Capabilities: []provider.Capability{provider.CapabilityChat}},
+		)),
+		mock.New(mock.WithName("anthropic")),
+	)
+	ctx := context.Background()
+
+	if names := m.ListProviders(); len(names) != 2 || names[0] != "anthropic" || names[1] != "openai" {
+		t.Errorf("ListProviders() = %v, want sorted [anthropic openai]", names)
+	}
+
+	p, err := m.GetProvider("openai")
+	if err != nil || p.Name() != "openai" {
+		t.Errorf("GetProvider() = %v, %v", p, err)
+	}
+
+	def, err := m.DefaultProvider()
+	if err != nil || def.Name() != "openai" {
+		t.Errorf("DefaultProvider() = %v, %v", def, err)
+	}
+
+	models, err := m.ListModels(ctx, "openai")
+	if err != nil || len(models) != 1 || models[0].ID != "gpt" {
+		t.Errorf("ListModels() = %v, %v", models, err)
+	}
+
+	caps, err := m.ProviderCapabilities(ctx, "openai")
+	if err != nil || !caps.Chat {
+		t.Errorf("ProviderCapabilities() = %+v, %v", caps, err)
+	}
+
+	if _, err := m.ListModels(ctx, "ghost"); !errors.Is(err, provider.ErrProviderNotFound) {
+		t.Errorf("ListModels(ghost) = %v, want ErrProviderNotFound", err)
+	}
+}

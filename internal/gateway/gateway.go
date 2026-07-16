@@ -32,6 +32,7 @@ import (
 	"github.com/symbiotes/modelmesh/internal/provider"
 	"github.com/symbiotes/modelmesh/internal/resilience"
 	"github.com/symbiotes/modelmesh/internal/routing"
+	"github.com/symbiotes/modelmesh/internal/shadow"
 	"github.com/symbiotes/modelmesh/internal/tracing"
 )
 
@@ -96,6 +97,11 @@ type Engine struct {
 	// analysis is turned into a per-request factor-weight override that adapts the
 	// routing decision (request-aware routing).
 	weigher *adaptive.Weigher
+
+	// Optional shadow-traffic layer. When set, a sampled fraction of successful
+	// requests is duplicated to a secondary provider for evaluation, never
+	// affecting the primary response.
+	shadow *shadow.Manager
 
 	// savings counters (token/cost saved by cache hits), tracked here because the
 	// gateway is where cached responses are decoded.
@@ -181,6 +187,18 @@ func WithAdaptiveWeighting(w *adaptive.Weigher) Option {
 	return func(e *Engine) {
 		if w != nil {
 			e.weigher = w
+		}
+	}
+}
+
+// WithShadow enables shadow traffic: after a successful primary response, a
+// sampled fraction of requests is duplicated to a secondary provider for
+// evaluation. The shadow runs asynchronously and its failures are isolated — the
+// application only ever receives the primary response. A nil manager is ignored.
+func WithShadow(s *shadow.Manager) Option {
+	return func(e *Engine) {
+		if s != nil {
+			e.shadow = s
 		}
 	}
 }
@@ -333,6 +351,12 @@ func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResul
 	// Score routing accuracy: did the routed model's tier match the recommendation?
 	if e.weigher != nil && analysisResult != nil {
 		e.weigher.RecordOutcome(analysisResult.Hints.PreferredModelTier, chosenModel(res))
+	}
+	// Shadow traffic: duplicate a sampled fraction to a secondary provider. This is
+	// fire-and-forget — it never touches res, so the application only ever receives
+	// the primary response.
+	if e.shadow != nil {
+		e.shadow.Shadow(ctx, req, shadow.Target{Provider: res.Response.Provider, Model: chosenModel(res)})
 	}
 	log.Info("request completed", fields...)
 	return res, nil

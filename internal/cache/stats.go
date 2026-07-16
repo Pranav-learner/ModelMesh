@@ -46,6 +46,9 @@ type StatsSnapshot struct {
 	Evictions int64   `json:"evictions"`
 	// Entries is the current number of stored items, set by levels that track it.
 	Entries int `json:"entries"`
+	// AvgSimilarity is the mean cosine similarity of hits; populated only by the
+	// semantic level (0 for exact levels).
+	AvgSimilarity float64 `json:"avg_similarity,omitempty"`
 }
 
 // Snapshot returns the current counters with derived lookups and hit ratio.

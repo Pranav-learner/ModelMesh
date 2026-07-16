@@ -1,6 +1,6 @@
 # ModelMesh — Cache Layer (Implementation Guide)
 
-**Status:** Implemented (Phase 3 Part 2 — L1 memory + L2 Redis + L3 semantic)
+**Status:** Implemented & finalized (Phase 3 complete — L1 memory + L2 Redis + L3 semantic)
 **Document type:** Implementation Guide
 **Last updated:** 2026-07-16
 **Related:** [Cache System LLD](../03-components/03-cache-system.md) · [ADR-006](./Architecture-Decisions.md#adr-006--why-three-cache-levels) · [ADR-007](./Architecture-Decisions.md#adr-007--why-redis)
@@ -75,14 +75,31 @@ Hits promote upward so repeats hit the fastest level: **L2 hit** → backfill L1
 so the next identical request is an exact L1 hit. Promotion is best-effort and
 preserves remaining TTL.
 
-## 8. Statistics
+## 8. Write Policy
 
-Per-level `StatsReporter` yields **MemoryHits / RedisHits / SemanticHits / Misses**
-via the Manager. **Tokens Saved** and **Estimated Cost Saved** are tracked at the
-**gateway** (which decodes cached responses to read `Usage` and applies an
+`Store` honors a configurable `WritePolicy` (via `WithWritePolicy`): `DisabledLevels`
+skips named levels (e.g. write-around L3) and `Async` populates the cache in the
+background (detached context) so the request path is never blocked by cache
+writes; in-flight async writes are drained on `Close`. The zero value is
+synchronous write-through to every level.
+
+## 9. Analytics
+
+`Manager.Stats()` (`ManagerStats`) reports **hit ratio**, **average lookup time**,
+per-source **memory/redis/semantic hit counts and rates**, and **average
+similarity** (from L3). **Tokens Saved** and **Estimated Cost Saved** are tracked
+at the **gateway** (which decodes cached responses to read `Usage` and applies an
 injected `CostEstimator`), since levels store opaque `[]byte`.
 
-## 9. Exported Types Reference
+## 10. Diagnostics
+
+Pure renderers make cache behavior inspectable: `ExplainHit(entry, found)` names
+the layer and, for L3, the similarity that cleared the threshold; `InspectEntry`
+shows layer, size, age, TTL, and similarity; `LayerUsed` gives a friendly layer
+name. The gateway's `ChatResult` carries `CacheLevel` and `Similarity`.
+The `cmd/cachedemo` command demonstrates the full pipeline offline.
+
+## 11. Exported Types Reference
 
 | Symbol | Role |
 |--------|------|

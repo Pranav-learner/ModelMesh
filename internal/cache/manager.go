@@ -3,6 +3,8 @@ package cache
 import (
 	"context"
 	"io"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/symbiotes/modelmesh/internal/logger"
@@ -25,6 +27,10 @@ type Manager struct {
 	stats    *Stats
 	log      logger.Logger
 	clock    func() time.Time
+	write    WritePolicy
+
+	lookupNanos atomic.Int64   // total time spent in Lookup (for the average)
+	asyncWrites sync.WaitGroup // tracks in-flight async populations, drained on Close
 }
 
 // Query describes a cache lookup across all levels. Key is the exact-match key
@@ -51,6 +57,12 @@ func WithLogger(l logger.Logger) ManagerOption {
 // WithSemantic attaches the optional L3 semantic level.
 func WithSemantic(s SemanticCache) ManagerOption {
 	return func(m *Manager) { m.semantic = s }
+}
+
+// WithWritePolicy sets the cache write policy (which levels to populate on Store,
+// and whether to populate asynchronously).
+func WithWritePolicy(p WritePolicy) ManagerOption {
+	return func(m *Manager) { m.write = p }
 }
 
 // WithManagerClock injects a time source (for TTL math in backfill).
@@ -110,6 +122,9 @@ func (m *Manager) Get(ctx context.Context, key string) (Entry, bool, error) {
 // repeat request is served from the fastest cache. A level error is logged and
 // treated as a miss (fail-safe).
 func (m *Manager) Lookup(ctx context.Context, q Query) (Entry, bool, error) {
+	start := m.clock()
+	defer func() { m.lookupNanos.Add(int64(m.clock().Sub(start))) }()
+
 	// Exact levels (L1, L2).
 	for i, level := range m.levels {
 		entry, found, err := level.Get(ctx, q.Key)
@@ -146,12 +161,34 @@ func (m *Manager) Lookup(ctx context.Context, q Query) (Entry, bool, error) {
 	return Entry{}, false, nil
 }
 
-// Store populates every level. Exact levels are keyed by q.Key; the semantic
-// level indexes q.Text under q.Model. Population is best-effort; the first error
-// is returned.
+// Store populates the cache according to the write policy. Exact levels are keyed
+// by q.Key; the semantic level indexes q.Text under q.Model. Population is
+// best-effort; when synchronous, the first level error is returned.
+//
+// With an async write policy, population runs in the background (detached from the
+// request context) so the request path is not blocked by cache writes; in-flight
+// async writes are drained by Close.
 func (m *Manager) Store(ctx context.Context, q Query, value []byte, ttl time.Duration) error {
+	m.stats.Set()
+
+	if m.write.Async {
+		m.asyncWrites.Add(1)
+		go func() {
+			defer m.asyncWrites.Done()
+			_ = m.populate(context.Background(), q, value, ttl)
+		}()
+		return nil
+	}
+	return m.populate(ctx, q, value, ttl)
+}
+
+// populate performs the actual writes honoring the per-level write policy.
+func (m *Manager) populate(ctx context.Context, q Query, value []byte, ttl time.Duration) error {
 	var firstErr error
 	for _, level := range m.levels {
+		if !m.write.writes(level.Name()) {
+			continue
+		}
 		if err := level.Set(ctx, q.Key, value, ttl); err != nil {
 			m.log.Warn("cache level set failed", logger.String("level", level.Name()), logger.Err(err))
 			if firstErr == nil {
@@ -159,7 +196,7 @@ func (m *Manager) Store(ctx context.Context, q Query, value []byte, ttl time.Dur
 			}
 		}
 	}
-	if m.semantic != nil && q.Text != "" {
+	if m.semantic != nil && q.Text != "" && m.write.writes(m.semantic.Name()) {
 		if err := m.semantic.Store(ctx, q.Text, q.Model, value, ttl); err != nil {
 			m.log.Warn("semantic cache store failed", logger.Err(err))
 			if firstErr == nil {
@@ -167,7 +204,6 @@ func (m *Manager) Store(ctx context.Context, q Query, value []byte, ttl time.Dur
 			}
 		}
 	}
-	m.stats.Set()
 	return firstErr
 }
 
@@ -246,8 +282,10 @@ func (m *Manager) Clear(ctx context.Context) error {
 	return firstErr
 }
 
-// Close closes every level (and the semantic level) that implements io.Closer.
+// Close drains any in-flight async cache writes, then closes every level (and the
+// semantic level) that implements io.Closer.
 func (m *Manager) Close() error {
+	m.asyncWrites.Wait()
 	var firstErr error
 	closeIfCloser := func(v any) {
 		if closer, ok := v.(io.Closer); ok {
@@ -265,10 +303,10 @@ func (m *Manager) Close() error {
 	return firstErr
 }
 
-// ManagerStats is the aggregated statistics view: overall read-through counters,
-// per-level statistics for levels that report them, and convenience per-source
-// hit counters. Token/cost savings are tracked at the gateway (which decodes the
-// cached responses), not here.
+// ManagerStats is the aggregated analytics view: overall read-through counters,
+// per-level statistics, per-source hit counts and rates, average lookup time, and
+// average semantic similarity. Token/cost savings are tracked at the gateway
+// (which decodes the cached responses), not here.
 type ManagerStats struct {
 	Overall StatsSnapshot            `json:"overall"`
 	Levels  map[string]StatsSnapshot `json:"levels"`
@@ -277,10 +315,19 @@ type ManagerStats struct {
 	RedisHits    int64 `json:"redis_hits"`
 	SemanticHits int64 `json:"semantic_hits"`
 	Misses       int64 `json:"misses"`
+
+	HitRatio        float64 `json:"hit_ratio"`
+	MemoryHitRate   float64 `json:"memory_hit_rate"`
+	RedisHitRate    float64 `json:"redis_hit_rate"`
+	SemanticHitRate float64 `json:"semantic_hit_rate"`
+
+	AverageLookupTime time.Duration `json:"average_lookup_time"`
+	AverageSimilarity float64       `json:"average_similarity"`
 }
 
-// Stats returns the composite statistics. Per-source hit counts are derived from
-// each level's own statistics (a level records its hits as it serves them).
+// Stats returns the composite analytics. Per-source hit counts come from each
+// level's own statistics (a level records hits as it serves them); rates are per
+// total lookups; average lookup time and similarity are Manager/L3 aggregates.
 func (m *Manager) Stats() ManagerStats {
 	levels := make(map[string]StatsSnapshot, len(m.levels)+1)
 	for _, level := range m.levels {
@@ -293,12 +340,23 @@ func (m *Manager) Stats() ManagerStats {
 	}
 
 	overall := m.stats.Snapshot()
-	return ManagerStats{
-		Overall:      overall,
-		Levels:       levels,
-		MemoryHits:   levels[LevelL1].Hits,
-		RedisHits:    levels[LevelL2].Hits,
-		SemanticHits: levels[LevelL3].Hits,
-		Misses:       overall.Misses,
+	lookups := overall.Lookups
+
+	stats := ManagerStats{
+		Overall:           overall,
+		Levels:            levels,
+		MemoryHits:        levels[LevelL1].Hits,
+		RedisHits:         levels[LevelL2].Hits,
+		SemanticHits:      levels[LevelL3].Hits,
+		Misses:            overall.Misses,
+		HitRatio:          overall.HitRatio,
+		AverageSimilarity: levels[LevelL3].AvgSimilarity,
 	}
+	if lookups > 0 {
+		stats.MemoryHitRate = float64(stats.MemoryHits) / float64(lookups)
+		stats.RedisHitRate = float64(stats.RedisHits) / float64(lookups)
+		stats.SemanticHitRate = float64(stats.SemanticHits) / float64(lookups)
+		stats.AverageLookupTime = time.Duration(m.lookupNanos.Load() / lookups)
+	}
+	return stats
 }

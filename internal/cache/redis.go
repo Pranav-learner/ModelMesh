@@ -122,15 +122,8 @@ func (c *RedisCache) Get(ctx context.Context, key string) (Entry, bool, error) {
 // Set stores value under key with the given TTL (or the default when ttl <= 0),
 // using Redis's native expiration.
 func (c *RedisCache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	effectiveTTL := ttl
-	if effectiveTTL <= 0 {
-		effectiveTTL = c.defaultTTL
-	}
 	now := c.clock()
-	var expiresAt time.Time
-	if effectiveTTL > 0 {
-		expiresAt = now.Add(effectiveTTL)
-	}
+	effectiveTTL, expiresAt := resolveExpiry(now, ttl, c.defaultTTL)
 	payload, err := json.Marshal(redisEnvelope{CreatedAt: now, ExpiresAt: expiresAt, Value: value})
 	if err != nil {
 		return err

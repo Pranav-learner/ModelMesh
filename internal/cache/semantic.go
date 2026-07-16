@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,6 +54,9 @@ type SemanticCacheImpl struct {
 	defaultTTL time.Duration
 	clock      func() time.Time
 	stats      *Stats
+	// simSumMicros accumulates the similarity of hits (score * 1e6) so the mean
+	// similarity can be reported lock-free.
+	simSumMicros atomic.Int64
 }
 
 // SemanticOption configures a SemanticCacheImpl.
@@ -125,11 +129,13 @@ func (s *SemanticCacheImpl) Lookup(ctx context.Context, text, model string) (Ent
 			continue // expired
 		}
 		s.stats.Hit()
+		s.simSumMicros.Add(int64(m.Score * 1e6))
 		return Entry{
-			Key:       m.ID,
-			Value:     p.Value,
-			CreatedAt: p.CreatedAt,
-			ExpiresAt: p.ExpiresAt,
+			Key:        m.ID,
+			Value:      p.Value,
+			CreatedAt:  p.CreatedAt,
+			ExpiresAt:  p.ExpiresAt,
+			Similarity: m.Score,
 		}, true, nil
 	}
 
@@ -144,14 +150,7 @@ func (s *SemanticCacheImpl) Store(ctx context.Context, text, model string, value
 		return err
 	}
 	now := s.clock()
-	effectiveTTL := ttl
-	if effectiveTTL <= 0 {
-		effectiveTTL = s.defaultTTL
-	}
-	var expiresAt time.Time
-	if effectiveTTL > 0 {
-		expiresAt = now.Add(effectiveTTL)
-	}
+	_, expiresAt := resolveExpiry(now, ttl, s.defaultTTL)
 
 	payload, err := json.Marshal(semanticPayload{
 		Model:     model,
@@ -180,10 +179,14 @@ func (s *SemanticCacheImpl) Clear(ctx context.Context) error {
 	return s.store.Clear(ctx)
 }
 
-// Stats returns the level's statistics, including the current entry count.
+// Stats returns the level's statistics, including the current entry count and
+// the mean similarity of hits.
 func (s *SemanticCacheImpl) Stats() StatsSnapshot {
 	snap := s.stats.Snapshot()
 	snap.Entries = s.store.Len()
+	if snap.Hits > 0 {
+		snap.AvgSimilarity = (float64(s.simSumMicros.Load()) / 1e6) / float64(snap.Hits)
+	}
 	return snap
 }
 

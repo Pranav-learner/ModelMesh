@@ -74,6 +74,27 @@ func (c SemanticConfig) withDefaults() SemanticConfig {
 	return c
 }
 
+// WritePolicy controls how the Manager populates the cache on a store. The zero
+// value is write-through to every level, synchronously.
+type WritePolicy struct {
+	// DisabledLevels lists level names to skip when populating (e.g. []{"l3"} to
+	// avoid semantic writes while still reading from L3). Empty writes all levels.
+	DisabledLevels []string `json:"disabled_levels,omitempty"`
+	// Async, when true, populates the cache in the background so the request path
+	// is not blocked by cache writes. In-flight writes are drained on Close.
+	Async bool `json:"async"`
+}
+
+// writes reports whether the policy permits writing to the named level.
+func (p WritePolicy) writes(level string) bool {
+	for _, d := range p.DisabledLevels {
+		if d == level {
+			return false
+		}
+	}
+	return true
+}
+
 // Config configures the cache subsystem.
 type Config struct {
 	// Enabled turns caching on or off. When false, the gateway skips the cache.
@@ -86,6 +107,8 @@ type Config struct {
 	Redis RedisConfig `json:"redis"`
 	// Semantic configures the optional L3 level.
 	Semantic SemanticConfig `json:"semantic"`
+	// Write is the cache write policy (which levels to populate, sync vs async).
+	Write WritePolicy `json:"write"`
 }
 
 // DefaultConfig returns an enabled cache configuration with sensible defaults.

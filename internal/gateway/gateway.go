@@ -110,9 +110,13 @@ func New(router Router, c Cache, cfg cache.Config, opts ...Option) *Engine {
 
 // ChatResult is the outcome of a cached chat request.
 type ChatResult struct {
-	Response   provider.ChatResponse
-	Cached     bool
+	Response provider.ChatResponse
+	Cached   bool
+	// CacheLevel is the cache layer that served the response ("l1"/"l2"/"l3"), or
+	// empty on a miss.
 	CacheLevel string
+	// Similarity is the cosine similarity of a semantic (L3) hit; 0 otherwise.
+	Similarity float64
 	Selection  *routing.Selection
 }
 
@@ -145,7 +149,13 @@ func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResul
 		var resp provider.ChatResponse
 		if err := json.Unmarshal(entry.Value, &resp); err == nil {
 			e.recordHit(resp, sel.Selected.Model, entry.Level)
-			return &ChatResult{Response: resp, Cached: true, CacheLevel: entry.Level, Selection: sel}, nil
+			return &ChatResult{
+				Response:   resp,
+				Cached:     true,
+				CacheLevel: entry.Level,
+				Similarity: entry.Similarity,
+				Selection:  sel,
+			}, nil
 		}
 		e.log.Warn("failed to decode cached response; treating as miss")
 	}

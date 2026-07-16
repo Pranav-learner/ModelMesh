@@ -129,14 +129,7 @@ func (m *MemoryCache) Set(ctx context.Context, key string, value []byte, ttl tim
 	}
 
 	now := m.now()
-	effectiveTTL := ttl
-	if effectiveTTL <= 0 {
-		effectiveTTL = m.defaultTTL
-	}
-	var expiresAt time.Time
-	if effectiveTTL > 0 {
-		expiresAt = now.Add(effectiveTTL)
-	}
+	_, expiresAt := resolveExpiry(now, ttl, m.defaultTTL)
 	entry := Entry{Key: key, Value: value, CreatedAt: now, ExpiresAt: expiresAt}
 
 	if el, ok := m.items[key]; ok {

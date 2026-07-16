@@ -33,6 +33,9 @@ type Entry struct {
 	// Level records which cache level served this entry. It is populated by the
 	// Manager on a hit and is empty for entries as stored within a level.
 	Level string `json:"level,omitempty"`
+	// Similarity is the cosine similarity of a semantic (L3) hit, in [0,1]. It is
+	// 0 for exact (L1/L2) hits and for stored entries.
+	Similarity float64 `json:"similarity,omitempty"`
 }
 
 // Expired reports whether the entry has expired as of now.
@@ -81,4 +84,18 @@ type Cache interface {
 // its statistics. The Manager surfaces per-level stats for levels that provide it.
 type StatsReporter interface {
 	Stats() StatsSnapshot
+}
+
+// resolveExpiry computes the effective TTL and absolute expiry time for a store,
+// shared by every level so TTL semantics are defined once: a non-positive ttl
+// inherits defaultTTL; a non-positive result means "never expires" (zero time).
+func resolveExpiry(now time.Time, ttl, defaultTTL time.Duration) (effectiveTTL time.Duration, expiresAt time.Time) {
+	effectiveTTL = ttl
+	if effectiveTTL <= 0 {
+		effectiveTTL = defaultTTL
+	}
+	if effectiveTTL > 0 {
+		expiresAt = now.Add(effectiveTTL)
+	}
+	return effectiveTTL, expiresAt
 }

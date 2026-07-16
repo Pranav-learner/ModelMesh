@@ -14,6 +14,10 @@ type Candidate struct {
 	Model    string  `json:"model"`
 	Weight   float64 `json:"weight"`
 	Score    float64 `json:"score"`
+	// Factors holds the per-scorer normalized scores that produced Score (keyed by
+	// scorer name: "cost", "latency", "availability", "quality"). It is populated
+	// by scoring strategies and empty otherwise.
+	Factors map[string]float64 `json:"factors,omitempty"`
 	// Reason is a short, human-readable note about how this candidate was treated
 	// by the active strategy.
 	Reason string `json:"reason,omitempty"`
@@ -92,20 +96,27 @@ type RoutingDecision struct {
 }
 
 // RoutingExplanation captures why a decision was made, for debugging and (later)
-// the router-explanation API surface.
+// the router-explanation API surface. It is both machine-readable (structured
+// fields) and human-readable (Reason).
 type RoutingExplanation struct {
-	Strategy   string                 `json:"strategy"`
-	Reason     string                 `json:"reason"`
+	Strategy string `json:"strategy"`
+	Reason   string `json:"reason"`
+	// Weights are the normalized scoring-factor weights used (scorer name -> weight
+	// summing to 1). Empty for strategies that do not score.
+	Weights    map[string]float64     `json:"weights,omitempty"`
 	Considered int                    `json:"considered"`
 	Candidates []CandidateExplanation `json:"candidates"`
 }
 
-// CandidateExplanation is a per-candidate record within an explanation.
+// CandidateExplanation is a per-candidate record within an explanation, carrying
+// the full score breakdown so a decision can be audited or rendered.
 type CandidateExplanation struct {
-	Provider string  `json:"provider"`
-	Model    string  `json:"model"`
-	Weight   float64 `json:"weight"`
-	Score    float64 `json:"score"`
-	Selected bool    `json:"selected"`
-	Reason   string  `json:"reason,omitempty"`
+	Provider string             `json:"provider"`
+	Model    string             `json:"model"`
+	Weight   float64            `json:"weight"`
+	Factors  map[string]float64 `json:"factors,omitempty"`
+	Score    float64            `json:"score"`
+	Rank     int                `json:"rank"`
+	Selected bool               `json:"selected"`
+	Reason   string             `json:"reason,omitempty"`
 }

@@ -29,9 +29,15 @@ func TestConfig_Validate(t *testing.T) {
 	}{
 		{"default", DefaultConfig(), false},
 		{"empty strategy", Config{Strategy: ""}, true},
-		{"negative default weight", Config{Strategy: "weighted", Weighted: WeightedConfig{DefaultWeight: -1}}, true},
-		{"negative weight entry", Config{Strategy: "weighted", Weighted: WeightedConfig{Weights: map[string]float64{"x": -2}}}, true},
-		{"valid weights", Config{Strategy: "weighted", Weighted: WeightedConfig{Weights: map[string]float64{"x": 3}}}, false},
+		{"negative default weight", Config{Strategy: "weighted", Weighted: WeightedConfig{DefaultWeight: -1, Factors: FactorWeights{Cost: 1}}}, true},
+		{"negative provider weight", Config{Strategy: "weighted", Weighted: WeightedConfig{Weights: map[string]float64{"x": -2}, Factors: FactorWeights{Cost: 1}}}, true},
+		{"valid tie-break weights", Config{Strategy: "weighted", Weighted: WeightedConfig{Weights: map[string]float64{"x": 3}, Factors: FactorWeights{Cost: 1}}}, false},
+		{"zero total factor weight", Config{Strategy: "weighted", Weighted: WeightedConfig{Factors: FactorWeights{}}}, true},
+		{"negative factor weight", Config{Strategy: "weighted", Weighted: WeightedConfig{Factors: FactorWeights{Cost: -1, Quality: 1}}}, true},
+		{"negative pricing", Config{Strategy: "weighted", Weighted: WeightedConfig{Factors: FactorWeights{Cost: 1}, Cost: CostConfig{Default: ModelPricing{InputPer1K: -1}}}}, true},
+		{"quality out of range", Config{Strategy: "weighted", Weighted: WeightedConfig{Factors: FactorWeights{Quality: 1}, Quality: QualityConfig{Default: 1.5}}}, true},
+		{"availability out of range", Config{Strategy: "weighted", Weighted: WeightedConfig{Factors: FactorWeights{Availability: 1}, Availability: AvailabilityConfig{Healthy: 2}}}, true},
+		{"negative latency", Config{Strategy: "weighted", Weighted: WeightedConfig{Factors: FactorWeights{Latency: 1}, Latency: LatencyConfig{Default: -1}}}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

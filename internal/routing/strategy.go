@@ -21,3 +21,12 @@ type Strategy interface {
 	// what the router supplied. Returning an empty slice yields ErrNoCandidates.
 	Rank(ctx context.Context, rc RoutingContext, candidates []Candidate) ([]Candidate, error)
 }
+
+// Explainer is an OPTIONAL interface a Strategy may implement to expose the
+// normalized scoring-factor weights it used, so the router can include them in
+// the routing explanation. Strategies that do not score need not implement it.
+type Explainer interface {
+	// NormalizedWeights returns the factor weights (summing to 1) used to combine
+	// per-factor scores.
+	NormalizedWeights() map[string]float64
+}

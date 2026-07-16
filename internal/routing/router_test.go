@@ -179,6 +179,79 @@ func TestBuild_InvalidConfigFailsFast(t *testing.T) {
 	}
 }
 
+func TestRoute_ExplanationIsComplete(t *testing.T) {
+	// "gpt" is both cheaper and higher quality than "claude" here, so it wins on
+	// score (not merely tie-break), and the explanation must reflect that.
+	src := fakeSource{
+		providers: []string{"anthropic", "openai"},
+		models: map[string][]provider.ModelInfo{
+			"openai":    {chatModel("gpt")},
+			"anthropic": {chatModel("claude")},
+		},
+	}
+	cfg := routing.DefaultConfig()
+	cfg.Weighted.Factors = routing.FactorWeights{Cost: 1, Quality: 1}
+	cfg.Weighted.Cost = routing.CostConfig{
+		Pricing: map[string]routing.ModelPricing{
+			"gpt":    {InputPer1K: 0.001},
+			"claude": {InputPer1K: 0.010},
+		},
+		EstimatedInputTokens: 1000,
+	}
+	cfg.Weighted.Quality = routing.QualityConfig{Models: map[string]float64{"gpt": 0.95, "claude": 0.90}}
+
+	r := newRouter(t, src, cfg)
+	dec, err := r.Route(context.Background(), routing.RoutingContext{Capability: provider.CapabilityChat})
+	if err != nil {
+		t.Fatalf("Route() = %v", err)
+	}
+
+	if dec.Selected.Model != "gpt" {
+		t.Fatalf("winner = %q, want gpt (cheaper + higher quality)", dec.Selected.Model)
+	}
+
+	ex := dec.Explanation
+	// Machine-readable: normalized weights present and summing to ~1.
+	total := 0.0
+	for _, w := range ex.Weights {
+		total += w
+	}
+	if total < 0.999 || total > 1.001 {
+		t.Errorf("explanation weights sum = %v, want ~1", total)
+	}
+	// Per-candidate breakdown present, ranked, exactly one selected.
+	if len(ex.Candidates) != 2 {
+		t.Fatalf("explanation candidates = %d, want 2", len(ex.Candidates))
+	}
+	top := ex.Candidates[0]
+	if !top.Selected || top.Rank != 1 || top.Provider != "openai" {
+		t.Errorf("top candidate wrong: %+v", top)
+	}
+	if len(top.Factors) != 4 {
+		t.Errorf("top candidate factors = %v, want 4 factors", top.Factors)
+	}
+	if ex.Candidates[1].Selected || ex.Candidates[1].Rank != 2 {
+		t.Errorf("runner-up wrong: %+v", ex.Candidates[1])
+	}
+	// Human-readable: the top-level reason explains the win.
+	if ex.Reason == "" || !contains(ex.Reason, "won") {
+		t.Errorf("explanation reason not human-readable: %q", ex.Reason)
+	}
+}
+
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && (s == sub || indexOfSub(s, sub) >= 0)
+}
+
+func indexOfSub(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
 // TestRoute_IntegratesWithProviderManager exercises the router against a REAL
 // provider.Manager (backed by mock providers), proving the ProviderSource seam
 // integrates with the completed Provider Layer.

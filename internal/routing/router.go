@@ -110,12 +110,18 @@ func (m *Manager) Route(ctx context.Context, rc RoutingContext) (RoutingDecision
 		return RoutingDecision{}, ErrNoCandidates
 	}
 
+	// If the strategy can explain its weighting, surface it in the explanation.
+	var weights map[string]float64
+	if ex, ok := m.strategy.(Explainer); ok {
+		weights = ex.NormalizedWeights()
+	}
+
 	selected := ranked[0]
 	decision := RoutingDecision{
 		Selected:    selected,
 		Candidates:  ranked,
 		Strategy:    m.strategy.Name(),
-		Explanation: buildExplanation(m.strategy.Name(), ranked),
+		Explanation: buildExplanation(m.strategy.Name(), ranked, weights),
 	}
 
 	m.log.Debug("routing decision",
@@ -165,26 +171,30 @@ func (m *Manager) enumerate(ctx context.Context, rc RoutingContext) []Candidate 
 }
 
 // buildExplanation constructs a structured explanation from the ranked
-// candidates, marking the first as selected.
-func buildExplanation(strategy string, ranked []Candidate) RoutingExplanation {
+// candidates (best first), carrying each candidate's factor breakdown, rank, and
+// reason, plus the normalized factor weights when the strategy provided them.
+func buildExplanation(strategy string, ranked []Candidate, weights map[string]float64) RoutingExplanation {
 	ce := make([]CandidateExplanation, len(ranked))
 	for i, c := range ranked {
 		ce[i] = CandidateExplanation{
 			Provider: c.Provider,
 			Model:    c.Model,
 			Weight:   c.Weight,
+			Factors:  c.Factors,
 			Score:    c.Score,
+			Rank:     i + 1,
 			Selected: i == 0,
 			Reason:   c.Reason,
 		}
 	}
 	reason := "no candidates"
 	if len(ranked) > 0 {
-		reason = "selected top-ranked candidate (scoring not yet applied)"
+		reason = ranked[0].Reason
 	}
 	return RoutingExplanation{
 		Strategy:   strategy,
 		Reason:     reason,
+		Weights:    weights,
 		Considered: len(ranked),
 		Candidates: ce,
 	}

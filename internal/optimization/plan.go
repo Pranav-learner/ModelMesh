@@ -23,6 +23,9 @@ type OptimizeRequest struct {
 	ExpectedOutputTokens int
 	// RequestID correlates the decision with logs and traces.
 	RequestID string
+	// Attributes are forward-compatible routing signals (e.g. from the Request
+	// Analysis Framework) merged into the routing context for every route call.
+	Attributes map[string]any
 }
 
 // Plan is the resolved optimization decision for one request: which provider,

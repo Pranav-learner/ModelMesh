@@ -118,8 +118,7 @@ func New(router Router, opts ...Option) *Optimizer {
 func (o *Optimizer) Optimize(ctx context.Context, req OptimizeRequest) (*Plan, error) {
 	o.requests.Add(1)
 
-	rc := routing.ChatContext(req.Chat)
-	rc.RequestID = req.RequestID
+	rc := o.routingContext(req)
 	decision, err := o.router.Route(ctx, rc)
 	if err != nil {
 		return nil, err
@@ -212,9 +211,8 @@ func (o *Optimizer) applyBudget(ctx context.Context, req OptimizeRequest, plan *
 
 		// Re-run routing with the downgraded model so the best provider for the
 		// cheaper model is chosen.
-		rc := routing.ChatContext(req.Chat)
+		rc := o.routingContext(req)
 		rc.Model = decision.Model
-		rc.RequestID = req.RequestID
 		if newDecision, rerr := o.router.Route(ctx, rc); rerr == nil {
 			plan.Decision = newDecision
 			plan.Provider = newDecision.Selected.Provider
@@ -272,6 +270,22 @@ func (o *Optimizer) emitBudgetUsage(scope budget.Scope, id string) {
 	if st, ok := o.budget.Budget(scope, id); ok {
 		o.metrics.BudgetUsage(string(scope), id, st.CurrentUsage, st.Remaining)
 	}
+}
+
+// routingContext builds the routing context for a request, carrying the
+// correlation ID and any analysis-derived attributes.
+func (o *Optimizer) routingContext(req OptimizeRequest) routing.RoutingContext {
+	rc := routing.ChatContext(req.Chat)
+	rc.RequestID = req.RequestID
+	for k, v := range req.Attributes {
+		if rc.Attributes == nil {
+			rc.Attributes = make(map[string]any, len(req.Attributes))
+		}
+		if _, exists := rc.Attributes[k]; !exists {
+			rc.Attributes[k] = v
+		}
+	}
+	return rc
 }
 
 // renderPrompt produces a canonical single-string view of the conversation for

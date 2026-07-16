@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/symbiotes/modelmesh/internal/analysis"
 	"github.com/symbiotes/modelmesh/internal/budget"
 	"github.com/symbiotes/modelmesh/internal/cache"
 	"github.com/symbiotes/modelmesh/internal/logger"
@@ -86,6 +87,10 @@ type Engine struct {
 	// load-balancer pipeline before dispatch (see chatOptimized).
 	optimizer *optimization.Optimizer
 
+	// Optional request-analysis layer. When set, every request is analyzed at
+	// entry and its routing hints enrich the routing context.
+	analyzer analysis.Analyzer
+
 	// savings counters (token/cost saved by cache hits), tracked here because the
 	// gateway is where cached responses are decoded.
 	requests      atomic.Int64
@@ -146,6 +151,18 @@ func WithOptimizer(o *optimization.Optimizer) Option {
 	return func(e *Engine) {
 		if o != nil {
 			e.optimizer = o
+		}
+	}
+}
+
+// WithAnalyzer enables the Request Analysis Framework: every request is analyzed
+// at entry, the result is attached to the ChatResult, and its routing hints
+// (token estimates + prompt features) enrich the routing context. A nil analyzer
+// is ignored.
+func WithAnalyzer(a analysis.Analyzer) Option {
+	return func(e *Engine) {
+		if a != nil {
+			e.analyzer = a
 		}
 	}
 }
@@ -215,6 +232,9 @@ type ChatResult struct {
 	// Optimization is set in optimized dispatch mode, carrying the budget verdict,
 	// any downgrade, and the chosen provider instance.
 	Optimization *optimization.Plan
+	// Analysis is set when the analyzer is enabled, carrying the structured
+	// request analysis produced before routing.
+	Analysis *analysis.AnalysisResult
 }
 
 // Chat resolves a chat request end to end: route to a provider/model, consult the
@@ -230,6 +250,15 @@ func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResul
 	ctx, span := e.tracer.Start(ctx, tracing.SpanRequest, tracing.String("request_id", requestID))
 	defer span.End()
 	start := time.Now()
+
+	// Request analysis runs before routing: it produces a structured result and
+	// carries it on the context so routing-context construction can enrich itself.
+	var analysisResult *analysis.AnalysisResult
+	if e.analyzer != nil {
+		r := e.analyzer.Analyze(ctx, req)
+		analysisResult = &r
+		ctx = analysis.NewContext(ctx, r)
+	}
 
 	var res *ChatResult
 	var err error
@@ -270,6 +299,7 @@ func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResul
 	if res.Failover != nil {
 		fields = append(fields, logger.Bool("failover", res.Failover.FailoverUsed))
 	}
+	res.Analysis = analysisResult
 	log.Info("request completed", fields...)
 	return res, nil
 }
@@ -341,13 +371,19 @@ func (e *Engine) chatOptimized(ctx context.Context, req provider.ChatRequest) (*
 	requestID, _ := tracing.RequestIDFromContext(ctx)
 	scope, id := budgetIdentity(req)
 
+	var analysisAttrs map[string]any
+	if ar, ok := analysis.FromContext(ctx); ok {
+		analysisAttrs = ar.Attributes()
+	}
+
 	ostart := time.Now()
 	octx, ospan := e.tracer.Start(ctx, tracing.SpanRoute)
 	plan, err := e.optimizer.Optimize(octx, optimization.OptimizeRequest{
-		Chat:      req,
-		Scope:     scope,
-		BudgetID:  id,
-		RequestID: requestID,
+		Chat:       req,
+		Scope:      scope,
+		BudgetID:   id,
+		RequestID:  requestID,
+		Attributes: analysisAttrs,
 	})
 	if err != nil {
 		ospan.RecordError(err)
@@ -427,13 +463,34 @@ func budgetIdentity(req provider.ChatRequest) (budget.Scope, string) {
 	return scope, req.Metadata[MetaBudgetID]
 }
 
-// routingContext builds a routing context carrying the correlation ID from ctx.
+// routingContext builds a routing context carrying the correlation ID from ctx
+// and, when request analysis ran, the analysis-derived routing hints.
 func (e *Engine) routingContext(ctx context.Context, req provider.ChatRequest) routing.RoutingContext {
 	rc := routing.ChatContext(req)
 	if id, ok := tracing.RequestIDFromContext(ctx); ok {
 		rc.RequestID = id
 	}
+	if ar, ok := analysis.FromContext(ctx); ok {
+		rc.Attributes = mergeAttributes(rc.Attributes, ar.Attributes())
+	}
 	return rc
+}
+
+// mergeAttributes returns base with the entries of extra applied, allocating a new
+// map when base is nil. Existing keys in base are preserved (caller intent wins).
+func mergeAttributes(base, extra map[string]any) map[string]any {
+	if len(extra) == 0 {
+		return base
+	}
+	if base == nil {
+		base = make(map[string]any, len(extra))
+	}
+	for k, v := range extra {
+		if _, exists := base[k]; !exists {
+			base[k] = v
+		}
+	}
+	return base
 }
 
 // lookup performs a traced cache lookup, returning the entry and whether it hit.

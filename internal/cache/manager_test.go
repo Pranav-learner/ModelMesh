@@ -126,6 +126,88 @@ func TestManager_EmptyIsNoop(t *testing.T) {
 	}
 }
 
+// --- multi-level (L1 + semantic L3) -----------------------------------------
+
+func newManagerWithSemantic(t *testing.T) (*Manager, *MemoryCache) {
+	t.Helper()
+	l1 := newL1(t)
+	emb := mockEmbedder{dims: 2, vectors: map[string][]float32{
+		"stored":  {1, 0},
+		"similar": {0.99, 0.14},
+		"distant": {0, 1},
+	}}
+	sem := NewSemanticCache(SemanticConfig{Threshold: 0.9, TopK: 5, EmbeddingDims: 2, DefaultTTL: time.Minute}, emb, nil)
+	m := NewManager([]Cache{l1}, WithSemantic(sem))
+	return m, l1
+}
+
+func TestManager_LookupOrder_ExactBeforeSemantic(t *testing.T) {
+	m, _ := newManagerWithSemantic(t)
+	ctx := context.Background()
+	// Seed an exact entry; a lookup with the same key must hit L1, never L3.
+	_ = m.Store(ctx, Query{Key: "k1", Model: "gpt", Text: "stored"}, []byte("exact"), time.Minute)
+
+	e, found, err := m.Lookup(ctx, Query{Key: "k1", Model: "gpt", Text: "stored"})
+	if err != nil || !found || string(e.Value) != "exact" {
+		t.Fatalf("Lookup = %q,%v,%v", e.Value, found, err)
+	}
+	if e.Level != LevelL1 {
+		t.Errorf("served level = %q, want l1 (exact wins)", e.Level)
+	}
+}
+
+func TestManager_SemanticHitAndPromotion(t *testing.T) {
+	m, l1 := newManagerWithSemantic(t)
+	ctx := context.Background()
+
+	// Store under key k1 / text "stored".
+	_ = m.Store(ctx, Query{Key: "k1", Model: "gpt", Text: "stored"}, []byte("cached"), time.Minute)
+
+	// Lookup a DIFFERENT key but a semantically-similar text -> exact miss, semantic hit.
+	q2 := Query{Key: "k2", Model: "gpt", Text: "similar"}
+	e, found, err := m.Lookup(ctx, q2)
+	if err != nil || !found || string(e.Value) != "cached" {
+		t.Fatalf("semantic Lookup = %q,%v,%v", e.Value, found, err)
+	}
+	if e.Level != LevelL3 {
+		t.Errorf("served level = %q, want l3", e.Level)
+	}
+
+	// Promotion: the semantic hit was written into L1 under k2, so the next lookup
+	// with k2 is an exact L1 hit.
+	if ok, _ := l1.Exists(ctx, "k2"); !ok {
+		t.Errorf("semantic hit was not promoted into L1")
+	}
+	e2, _, _ := m.Lookup(ctx, q2)
+	if e2.Level != LevelL1 {
+		t.Errorf("after promotion, level = %q, want l1", e2.Level)
+	}
+}
+
+func TestManager_MultiSourceStats(t *testing.T) {
+	m, _ := newManagerWithSemantic(t)
+	ctx := context.Background()
+
+	_ = m.Store(ctx, Query{Key: "k1", Model: "gpt", Text: "stored"}, []byte("v"), time.Minute)
+	_, _, _ = m.Lookup(ctx, Query{Key: "k1", Model: "gpt", Text: "stored"})  // L1 hit
+	_, _, _ = m.Lookup(ctx, Query{Key: "k2", Model: "gpt", Text: "similar"}) // semantic hit
+	_, _, _ = m.Lookup(ctx, Query{Key: "k3", Model: "gpt", Text: "distant"}) // miss
+
+	s := m.Stats()
+	if s.MemoryHits < 1 {
+		t.Errorf("MemoryHits = %d, want >=1", s.MemoryHits)
+	}
+	if s.SemanticHits != 1 {
+		t.Errorf("SemanticHits = %d, want 1", s.SemanticHits)
+	}
+	if s.Misses != 1 {
+		t.Errorf("Misses = %d, want 1", s.Misses)
+	}
+	if _, ok := s.Levels[LevelL3]; !ok {
+		t.Errorf("per-level stats missing L3")
+	}
+}
+
 func TestManager_Close(t *testing.T) {
 	l1 := NewMemoryCache(MemoryConfig{CleanupInterval: 10 * time.Millisecond})
 	m := NewManager([]Cache{l1})

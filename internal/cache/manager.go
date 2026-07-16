@@ -20,10 +20,20 @@ var _ Cache = (*Manager)(nil)
 // here: on a hit at level i, faster levels 0..i-1 are backfilled with the entry's
 // remaining TTL.
 type Manager struct {
-	levels []Cache
-	stats  *Stats
-	log    logger.Logger
-	clock  func() time.Time
+	levels   []Cache       // exact-match levels, fastest first (L1, L2)
+	semantic SemanticCache // optional L3 semantic level
+	stats    *Stats
+	log      logger.Logger
+	clock    func() time.Time
+}
+
+// Query describes a cache lookup across all levels. Key is the exact-match key
+// used by L1/L2; Text and Model drive the semantic L3 level. An empty Text
+// disables the semantic level for that request.
+type Query struct {
+	Key   string
+	Model string
+	Text  string
 }
 
 // ManagerOption configures a Manager.
@@ -36,6 +46,11 @@ func WithLogger(l logger.Logger) ManagerOption {
 			m.log = l
 		}
 	}
+}
+
+// WithSemantic attaches the optional L3 semantic level.
+func WithSemantic(s SemanticCache) ManagerOption {
+	return func(m *Manager) { m.semantic = s }
 }
 
 // WithManagerClock injects a time source (for TTL math in backfill).
@@ -81,7 +96,7 @@ func (m *Manager) Get(ctx context.Context, key string) (Entry, bool, error) {
 			continue
 		}
 		entry.Level = level.Name()
-		m.backfill(ctx, i, entry)
+		m.promoteTo(ctx, i, key, entry)
 		m.stats.Hit()
 		return entry, true, nil
 	}
@@ -89,16 +104,84 @@ func (m *Manager) Get(ctx context.Context, key string) (Entry, bool, error) {
 	return Entry{}, false, nil
 }
 
-// backfill populates faster levels (0..i-1) with a hit found at level i,
-// preserving its remaining TTL. Failures are best-effort and logged.
-func (m *Manager) backfill(ctx context.Context, hitLevel int, entry Entry) {
-	if hitLevel == 0 {
+// Lookup performs the full multi-level lookup in order L1 -> L2 -> L3. Exact
+// levels are tried first by key; on a miss, the semantic level is consulted by
+// text/model. A hit at any level promotes the entry to all faster levels, so a
+// repeat request is served from the fastest cache. A level error is logged and
+// treated as a miss (fail-safe).
+func (m *Manager) Lookup(ctx context.Context, q Query) (Entry, bool, error) {
+	// Exact levels (L1, L2).
+	for i, level := range m.levels {
+		entry, found, err := level.Get(ctx, q.Key)
+		if err != nil {
+			m.log.Warn("cache level get failed; treating as miss",
+				logger.String("level", level.Name()), logger.Err(err))
+			continue
+		}
+		if !found {
+			continue
+		}
+		entry.Level = level.Name()
+		m.promoteTo(ctx, i, q.Key, entry)
+		m.stats.Hit()
+		return entry, true, nil
+	}
+
+	// Semantic level (L3).
+	if m.semantic != nil && q.Text != "" {
+		entry, found, err := m.semantic.Lookup(ctx, q.Text, q.Model)
+		if err != nil {
+			m.log.Warn("semantic cache lookup failed; treating as miss", logger.Err(err))
+		} else if found {
+			entry.Level = m.semantic.Name()
+			// Promote a semantic hit into every exact level so the next identical
+			// request is an exact hit.
+			m.promoteTo(ctx, len(m.levels), q.Key, entry)
+			m.stats.Hit()
+			return entry, true, nil
+		}
+	}
+
+	m.stats.Miss()
+	return Entry{}, false, nil
+}
+
+// Store populates every level. Exact levels are keyed by q.Key; the semantic
+// level indexes q.Text under q.Model. Population is best-effort; the first error
+// is returned.
+func (m *Manager) Store(ctx context.Context, q Query, value []byte, ttl time.Duration) error {
+	var firstErr error
+	for _, level := range m.levels {
+		if err := level.Set(ctx, q.Key, value, ttl); err != nil {
+			m.log.Warn("cache level set failed", logger.String("level", level.Name()), logger.Err(err))
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	if m.semantic != nil && q.Text != "" {
+		if err := m.semantic.Store(ctx, q.Text, q.Model, value, ttl); err != nil {
+			m.log.Warn("semantic cache store failed", logger.Err(err))
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	m.stats.Set()
+	return firstErr
+}
+
+// promoteTo backfills exact levels 0..upTo-1 with an entry, preserving its
+// remaining TTL. It is used both for read-through backfill (a hit at exact level
+// i backfills 0..i-1) and semantic promotion (upTo = len(levels)).
+func (m *Manager) promoteTo(ctx context.Context, upTo int, key string, entry Entry) {
+	if upTo <= 0 {
 		return
 	}
 	ttl := entry.RemainingTTL(m.clock())
-	for j := 0; j < hitLevel; j++ {
-		if err := m.levels[j].Set(ctx, entry.Key, entry.Value, ttl); err != nil {
-			m.log.Warn("cache backfill failed",
+	for j := 0; j < upTo && j < len(m.levels); j++ {
+		if err := m.levels[j].Set(ctx, key, entry.Value, ttl); err != nil {
+			m.log.Warn("cache promotion failed",
 				logger.String("level", m.levels[j].Name()), logger.Err(err))
 		}
 	}
@@ -147,7 +230,7 @@ func (m *Manager) Exists(ctx context.Context, key string) (bool, error) {
 	return false, nil
 }
 
-// Clear clears every level.
+// Clear clears every level, including the semantic level.
 func (m *Manager) Clear(ctx context.Context) error {
 	var firstErr error
 	for _, level := range m.levels {
@@ -155,36 +238,67 @@ func (m *Manager) Clear(ctx context.Context) error {
 			firstErr = err
 		}
 	}
+	if m.semantic != nil {
+		if err := m.semantic.Clear(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	return firstErr
 }
 
-// Close closes every level that implements io.Closer (e.g. stopping janitors).
+// Close closes every level (and the semantic level) that implements io.Closer.
 func (m *Manager) Close() error {
 	var firstErr error
-	for _, level := range m.levels {
-		if closer, ok := level.(io.Closer); ok {
+	closeIfCloser := func(v any) {
+		if closer, ok := v.(io.Closer); ok {
 			if err := closer.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
 	}
+	for _, level := range m.levels {
+		closeIfCloser(level)
+	}
+	if m.semantic != nil {
+		closeIfCloser(m.semantic)
+	}
 	return firstErr
 }
 
-// ManagerStats is the aggregated statistics view: overall read-through counters
-// plus per-level statistics for levels that report them.
+// ManagerStats is the aggregated statistics view: overall read-through counters,
+// per-level statistics for levels that report them, and convenience per-source
+// hit counters. Token/cost savings are tracked at the gateway (which decodes the
+// cached responses), not here.
 type ManagerStats struct {
 	Overall StatsSnapshot            `json:"overall"`
 	Levels  map[string]StatsSnapshot `json:"levels"`
+
+	MemoryHits   int64 `json:"memory_hits"`
+	RedisHits    int64 `json:"redis_hits"`
+	SemanticHits int64 `json:"semantic_hits"`
+	Misses       int64 `json:"misses"`
 }
 
-// Stats returns the composite statistics.
+// Stats returns the composite statistics. Per-source hit counts are derived from
+// each level's own statistics (a level records its hits as it serves them).
 func (m *Manager) Stats() ManagerStats {
-	levels := make(map[string]StatsSnapshot, len(m.levels))
+	levels := make(map[string]StatsSnapshot, len(m.levels)+1)
 	for _, level := range m.levels {
 		if reporter, ok := level.(StatsReporter); ok {
 			levels[level.Name()] = reporter.Stats()
 		}
 	}
-	return ManagerStats{Overall: m.stats.Snapshot(), Levels: levels}
+	if reporter, ok := m.semantic.(StatsReporter); ok {
+		levels[m.semantic.Name()] = reporter.Stats()
+	}
+
+	overall := m.stats.Snapshot()
+	return ManagerStats{
+		Overall:      overall,
+		Levels:       levels,
+		MemoryHits:   levels[LevelL1].Hits,
+		RedisHits:    levels[LevelL2].Hits,
+		SemanticHits: levels[LevelL3].Hits,
+		Misses:       overall.Misses,
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/symbiotes/modelmesh/internal/cache"
 	"github.com/symbiotes/modelmesh/internal/gateway"
@@ -146,6 +147,59 @@ func TestGateway_CorruptCachedValueFallsThrough(t *testing.T) {
 	}
 	if atomic.LoadInt32(&calls) != 1 {
 		t.Errorf("provider should have been dispatched on decode failure")
+	}
+}
+
+func newSemanticGateway(t *testing.T, calls *int32) *gateway.Engine {
+	t.Helper()
+	reg := provider.NewRegistry()
+	_ = reg.Register(countingProvider("openai", calls))
+	pm := provider.NewManager(reg, provider.WithDefaultProvider("openai"))
+	router, err := routing.Build(pm, routing.DefaultConfig())
+	if err != nil {
+		t.Fatalf("routing.Build: %v", err)
+	}
+
+	l1 := cache.NewMemoryCache(cache.DefaultConfig().Memory)
+	t.Cleanup(func() { _ = l1.Close() })
+	// nil embedder/store -> hashing embedder + in-memory vector store.
+	sem := cache.NewSemanticCache(cache.SemanticConfig{Threshold: 0.92, TopK: 5, EmbeddingDims: 128, DefaultTTL: time.Minute}, nil, nil)
+	cm := cache.NewManager([]cache.Cache{l1}, cache.WithSemantic(sem))
+
+	// A cost estimator so cost-saved statistics are exercised.
+	est := func(model string, u provider.Usage) float64 { return float64(u.TotalTokens) * 0.001 }
+	return gateway.New(router, cm, cache.DefaultConfig(), gateway.WithCostEstimator(est))
+}
+
+func TestGateway_SemanticHit(t *testing.T) {
+	var calls int32
+	e := newSemanticGateway(t, &calls)
+	ctx := context.Background()
+
+	// First request: exact + semantic miss -> dispatch -> populate all levels.
+	if _, err := e.Chat(ctx, chatReq("explain caching in distributed systems")); err != nil {
+		t.Fatalf("Chat #1 = %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("provider calls after first = %d, want 1", got)
+	}
+
+	// A near-identical prompt (trailing period) has a DIFFERENT exact key but the
+	// same tokens, so it misses L1/L2 exact and hits L3 semantic.
+	r2, err := e.Chat(ctx, chatReq("explain caching in distributed systems."))
+	if err != nil {
+		t.Fatalf("Chat #2 = %v", err)
+	}
+	if !r2.Cached || r2.CacheLevel != cache.LevelL3 {
+		t.Errorf("second call not a semantic hit: cached=%v level=%q", r2.Cached, r2.CacheLevel)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("provider re-dispatched on semantic hit; calls = %d, want 1", got)
+	}
+
+	st := e.Stats()
+	if st.Hits != 1 || st.TokensSaved == 0 || st.CostSavedUSD == 0 {
+		t.Errorf("savings not recorded: %+v", st)
 	}
 }
 

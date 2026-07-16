@@ -1,6 +1,6 @@
 # ModelMesh — Cache Layer (Implementation Guide)
 
-**Status:** Implemented (Phase 3 Part 1 — framework + L1)
+**Status:** Implemented (Phase 3 Part 2 — L1 memory + L2 Redis + L3 semantic)
 **Document type:** Implementation Guide
 **Last updated:** 2026-07-16
 **Related:** [Cache System LLD](../03-components/03-cache-system.md) · [ADR-006](./Architecture-Decisions.md#adr-006--why-three-cache-levels) · [ADR-007](./Architecture-Decisions.md#adr-007--why-redis)
@@ -49,14 +49,40 @@ deterministically by `Close` (via a stop channel + done channel). All exported
 operations are safe for concurrent use and verified under `go test -race`.
 Per-shard mutexes to reduce contention are a documented future optimization.
 
-## 5. Extension Points (Part 2 and beyond)
+## 5. L2 Redis (exact, fleet-shared)
 
-- **Add L2 (Redis):** implement `Cache` (Get/Set/Delete/Exists/Clear over Redis, `[]byte` values), add it to the Manager's level list after L1. Read-through, backfill, write-through, and stats work unchanged. Optionally implement `io.Closer` (connection cleanup) and `StatsReporter`.
-- **Add L3 (semantic):** implement `Cache` with an embedding-based `Get`; provide a semantic `KeyGenerator` variant or a similarity lookup behind the same interface.
-- **Alternative eviction / sharding:** swap the L1 internals behind the `Cache` interface without touching the Manager or gateway.
-- **Config:** `cache.Config` grows additively (e.g. a future `Redis` sub-config); `Validate` fails fast.
+`RedisCache` implements the same `Cache` interface over `go-redis`, storing a JSON
+envelope (value + timestamps) with Redis-native `EX` expiry. Namespaced by a key
+prefix, so `Clear` scans and deletes only its own keys (never `FLUSHDB`). It
+depends on a narrow `RedisClient` interface (client/cluster/fake injectable) and
+is unit-tested against **miniredis** (in-process Redis) — no live server. A Redis
+error is treated as a miss by the Manager (fail-safe); a corrupt value self-heals.
 
-## 6. Exported Types Reference
+## 6. L3 Semantic Cache
+
+Pipeline **text → embedding → vector search → similarity → threshold → hit**,
+behind a distinct `SemanticCache` interface (`Lookup(text, model)` / `Store`),
+since matching is by similarity, not exact key.
+
+- **Embedding abstraction** (`Embedder`): text → vector. Ships a deterministic `HashingEmbedder` for local/tests; a real provider-backed embedder implements the same interface — **not coupled to one model**.
+- **Vector store abstraction** (`VectorStore`): `Add/Search/Delete/Clear`. Ships a thread-safe brute-force `MemoryVectorStore` (cosine); an ANN/Redis-vector backend implements the same interface.
+- **Similarity + safety:** a match qualifies only if `cosine ≥ threshold` (default 0.92) **and** the stored model matches **and** it is unexpired — a below-threshold/mismatched result is a miss, never a wrong answer.
+
+## 7. Cache Promotion Strategy
+
+Hits promote upward so repeats hit the fastest level: **L2 hit** → backfill L1;
+**L3 semantic hit** → promote into all exact levels (L1, L2) under the exact key,
+so the next identical request is an exact L1 hit. Promotion is best-effort and
+preserves remaining TTL.
+
+## 8. Statistics
+
+Per-level `StatsReporter` yields **MemoryHits / RedisHits / SemanticHits / Misses**
+via the Manager. **Tokens Saved** and **Estimated Cost Saved** are tracked at the
+**gateway** (which decodes cached responses to read `Usage` and applies an
+injected `CostEstimator`), since levels store opaque `[]byte`.
+
+## 9. Exported Types Reference
 
 | Symbol | Role |
 |--------|------|

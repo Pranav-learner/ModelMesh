@@ -26,6 +26,7 @@ import (
 	"github.com/symbiotes/modelmesh/internal/provider"
 	"github.com/symbiotes/modelmesh/internal/resilience"
 	"github.com/symbiotes/modelmesh/internal/routing"
+	"github.com/symbiotes/modelmesh/internal/tracing"
 )
 
 // Router is the narrow view of the Routing Engine the gateway needs.
@@ -62,6 +63,7 @@ type Engine struct {
 	cfg    cache.Config
 	log    logger.Logger
 	cost   CostEstimator
+	tracer tracing.Tracer
 
 	// Optional resilience layer. When both are set, Chat dispatches with
 	// breaker-guarded automatic failover across the routing candidate list.
@@ -120,6 +122,16 @@ func WithFailover(f *resilience.Failover, providers ProviderResolver) Option {
 	}
 }
 
+// WithTracer injects a distributed tracer. A nil tracer is ignored (the default
+// is a no-op tracer).
+func WithTracer(t tracing.Tracer) Option {
+	return func(e *Engine) {
+		if t != nil {
+			e.tracer = t
+		}
+	}
+}
+
 // New constructs a gateway Engine over a router and cache.
 func New(router Router, c Cache, cfg cache.Config, opts ...Option) *Engine {
 	e := &Engine{
@@ -128,6 +140,7 @@ func New(router Router, c Cache, cfg cache.Config, opts ...Option) *Engine {
 		keys:   cache.NewKeyGenerator(),
 		cfg:    cfg.WithDefaults(),
 		log:    logger.Nop(),
+		tracer: tracing.Noop(),
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -158,21 +171,71 @@ type ChatResult struct {
 // response came from cache or the provider except via the metadata.
 func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResult, error) {
 	e.requests.Add(1)
+
+	// Correlation + root span: every request gets a request ID and a trace.
+	ctx, requestID := tracing.EnsureRequestID(ctx)
+	ctx, span := e.tracer.Start(ctx, tracing.SpanRequest, tracing.String("request_id", requestID))
+	defer span.End()
+	start := time.Now()
+
+	var res *ChatResult
+	var err error
 	if e.failover != nil {
-		return e.chatWithFailover(ctx, req)
+		res, err = e.chatWithFailover(ctx, req)
+	} else {
+		res, err = e.chatSimple(ctx, req)
 	}
-	return e.chatSimple(ctx, req)
+
+	log := tracing.LoggerWith(ctx, e.log)
+	duration := time.Since(start)
+	if err != nil {
+		span.RecordError(err)
+		log.Error("request failed", logger.Err(err), logger.String("latency", duration.String()))
+		return nil, err
+	}
+
+	span.SetAttributes(
+		tracing.String("provider", res.Response.Provider),
+		tracing.String("model", res.Response.Model),
+		tracing.Bool("cached", res.Cached),
+		tracing.String("cache_level", res.CacheLevel),
+	)
+	fields := []logger.Field{
+		logger.String("provider", res.Response.Provider),
+		logger.String("model", res.Response.Model),
+		logger.Bool("cached", res.Cached),
+		logger.String("cache_level", res.CacheLevel),
+		logger.String("latency", duration.String()),
+	}
+	if res.Selection != nil {
+		fields = append(fields, logger.Any("score", res.Selection.Selected.Score))
+	}
+	if res.Failover != nil {
+		fields = append(fields, logger.Bool("failover", res.Failover.FailoverUsed))
+	}
+	log.Info("request completed", fields...)
+	return res, nil
 }
 
 // chatSimple dispatches to the single selected provider (no failover).
 func (e *Engine) chatSimple(ctx context.Context, req provider.ChatRequest) (*ChatResult, error) {
-	sel, err := e.router.Select(ctx, routing.ChatContext(req))
+	rctx, rspan := e.tracer.Start(ctx, tracing.SpanRoute)
+	sel, err := e.router.Select(rctx, e.routingContext(ctx, req))
 	if err != nil {
+		rspan.RecordError(err)
+		rspan.End()
 		return nil, err
 	}
+	rspan.SetAttributes(
+		tracing.String("strategy", sel.Decision.Strategy),
+		tracing.String("provider", sel.Selected.Provider),
+		tracing.String("model", sel.Selected.Model),
+		tracing.Float("score", sel.Selected.Score),
+	)
+	rspan.End()
 
 	if !e.cfg.Enabled {
-		resp, err := sel.Provider.Chat(ctx, req)
+		resp, err := e.dispatch(ctx, sel.Provider, sel.Selected.Provider, sel.Selected.Model, req)
 		if err != nil {
 			return nil, err
 		}
@@ -185,7 +248,7 @@ func (e *Engine) chatSimple(ctx context.Context, req provider.ChatRequest) (*Cha
 		Text:  renderPrompt(req.Messages),
 	}
 
-	if entry, found, gerr := e.cache.Lookup(ctx, q); gerr == nil && found {
+	if entry, found := e.lookup(ctx, q); found {
 		var resp provider.ChatResponse
 		if err := json.Unmarshal(entry.Value, &resp); err == nil {
 			e.recordHit(resp, sel.Selected.Model, entry.Level)
@@ -201,19 +264,59 @@ func (e *Engine) chatSimple(ctx context.Context, req provider.ChatRequest) (*Cha
 	}
 
 	e.misses.Add(1)
-	resp, err := sel.Provider.Chat(ctx, req)
+	resp, err := e.dispatch(ctx, sel.Provider, sel.Selected.Provider, sel.Selected.Model, req)
 	if err != nil {
 		return nil, err
 	}
-
-	// Best-effort population of every level: a cache write never fails the response.
-	if value, merr := json.Marshal(resp); merr == nil {
-		if serr := e.cache.Store(ctx, q, value, e.cfg.DefaultTTL); serr != nil {
-			e.log.Warn("cache population failed", logger.Err(serr))
-		}
-	}
-
+	e.populate(ctx, q, resp)
 	return &ChatResult{Response: resp, Cached: false, Selection: sel}, nil
+}
+
+// routingContext builds a routing context carrying the correlation ID from ctx.
+func (e *Engine) routingContext(ctx context.Context, req provider.ChatRequest) routing.RoutingContext {
+	rc := routing.ChatContext(req)
+	if id, ok := tracing.RequestIDFromContext(ctx); ok {
+		rc.RequestID = id
+	}
+	return rc
+}
+
+// lookup performs a traced cache lookup, returning the entry and whether it hit.
+func (e *Engine) lookup(ctx context.Context, q cache.Query) (cache.Entry, bool) {
+	cctx, cspan := e.tracer.Start(ctx, tracing.SpanCacheLookup)
+	defer cspan.End()
+	entry, found, err := e.cache.Lookup(cctx, q)
+	hit := err == nil && found
+	cspan.SetAttributes(tracing.Bool("hit", hit))
+	if hit {
+		cspan.SetAttributes(tracing.String("level", entry.Level), tracing.Float("similarity", entry.Similarity))
+	}
+	return entry, hit
+}
+
+// populate best-effort stores the response; a cache write never fails a response.
+func (e *Engine) populate(ctx context.Context, q cache.Query, resp provider.ChatResponse) {
+	value, merr := json.Marshal(resp)
+	if merr != nil {
+		return
+	}
+	if serr := e.cache.Store(ctx, q, value, e.cfg.DefaultTTL); serr != nil {
+		e.log.Warn("cache population failed", logger.Err(serr))
+	}
+}
+
+// dispatch performs a traced provider call.
+func (e *Engine) dispatch(ctx context.Context, p provider.LLMProvider, providerName, model string, req provider.ChatRequest) (provider.ChatResponse, error) {
+	pctx, pspan := e.tracer.Start(ctx, tracing.SpanProviderCall,
+		tracing.String("provider", providerName), tracing.String("model", model))
+	defer pspan.End()
+	resp, err := p.Chat(pctx, req)
+	if err != nil {
+		pspan.RecordError(err)
+		return provider.ChatResponse{}, err
+	}
+	pspan.SetStatus(true, "")
+	return resp, nil
 }
 
 // chatWithFailover dispatches with breaker-guarded automatic failover across the
@@ -223,15 +326,26 @@ func (e *Engine) chatSimple(ctx context.Context, req provider.ChatRequest) (*Cha
 // and a failing provider fails over to the next. The response is cached under the
 // intended key regardless of which provider ultimately served it.
 func (e *Engine) chatWithFailover(ctx context.Context, req provider.ChatRequest) (*ChatResult, error) {
-	decision, err := e.router.Route(ctx, routing.ChatContext(req))
+	rctx, rspan := e.tracer.Start(ctx, tracing.SpanRoute)
+	decision, err := e.router.Route(rctx, e.routingContext(ctx, req))
 	if err != nil {
+		rspan.RecordError(err)
+		rspan.End()
 		return nil, err
 	}
+	rspan.SetAttributes(
+		tracing.String("strategy", decision.Strategy),
+		tracing.String("provider", decision.Selected.Provider),
+		tracing.String("model", decision.Selected.Model),
+		tracing.Int("candidates", len(decision.Candidates)),
+	)
+	rspan.End()
+
 	topModel := decision.Selected.Model
 	q := cache.Query{Key: e.keys.ChatKey(topModel, req), Model: topModel, Text: renderPrompt(req.Messages)}
 
 	if e.cfg.Enabled {
-		if entry, found, gerr := e.cache.Lookup(ctx, q); gerr == nil && found {
+		if entry, found := e.lookup(ctx, q); found {
 			var resp provider.ChatResponse
 			if err := json.Unmarshal(entry.Value, &resp); err == nil {
 				e.recordHit(resp, topModel, entry.Level)
@@ -242,13 +356,14 @@ func (e *Engine) chatWithFailover(ctx context.Context, req provider.ChatRequest)
 		e.misses.Add(1)
 	}
 
+	dctx, dspan := e.tracer.Start(ctx, tracing.SpanDispatch)
 	var resp provider.ChatResponse
-	outcome, err := e.failover.Do(ctx, toTargets(decision.Candidates), func(cctx context.Context, tg resilience.Target) error {
+	outcome, err := e.failover.Do(dctx, toTargets(decision.Candidates), func(cctx context.Context, tg resilience.Target) error {
 		p, gerr := e.providers.GetProvider(tg.Provider)
 		if gerr != nil {
 			return gerr
 		}
-		r, cerr := p.Chat(cctx, withModel(req, tg.Model))
+		r, cerr := e.dispatch(cctx, p, tg.Provider, tg.Model, withModel(req, tg.Model))
 		if cerr != nil {
 			return cerr
 		}
@@ -256,15 +371,19 @@ func (e *Engine) chatWithFailover(ctx context.Context, req provider.ChatRequest)
 		return nil
 	})
 	if err != nil {
+		dspan.RecordError(err)
+		dspan.End()
 		return nil, err
 	}
+	dspan.SetAttributes(
+		tracing.String("served", outcome.Served.Provider),
+		tracing.Bool("failover", outcome.FailoverUsed),
+		tracing.Int("attempts", len(outcome.Attempts)),
+	)
+	dspan.End()
 
 	if e.cfg.Enabled {
-		if value, merr := json.Marshal(resp); merr == nil {
-			if serr := e.cache.Store(ctx, q, value, e.cfg.DefaultTTL); serr != nil {
-				e.log.Warn("cache population failed", logger.Err(serr))
-			}
-		}
+		e.populate(ctx, q, resp)
 	}
 	return &ChatResult{Response: resp, Cached: false, Failover: &outcome}, nil
 }

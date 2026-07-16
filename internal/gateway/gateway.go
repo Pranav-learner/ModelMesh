@@ -17,17 +17,27 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/symbiotes/modelmesh/internal/budget"
 	"github.com/symbiotes/modelmesh/internal/cache"
 	"github.com/symbiotes/modelmesh/internal/logger"
 	"github.com/symbiotes/modelmesh/internal/metrics"
+	"github.com/symbiotes/modelmesh/internal/optimization"
 	"github.com/symbiotes/modelmesh/internal/provider"
 	"github.com/symbiotes/modelmesh/internal/resilience"
 	"github.com/symbiotes/modelmesh/internal/routing"
 	"github.com/symbiotes/modelmesh/internal/tracing"
+)
+
+// Request metadata keys through which the caller supplies budget identity to the
+// optimization layer. Absent keys skip the budget stage.
+const (
+	MetaBudgetScope = "budget_scope" // "user" (default) or "team"
+	MetaBudgetID    = "budget_id"    // the user/team identifier
 )
 
 // Router is the narrow view of the Routing Engine the gateway needs.
@@ -71,6 +81,10 @@ type Engine struct {
 	// breaker-guarded automatic failover across the routing candidate list.
 	failover  *resilience.Failover
 	providers ProviderResolver
+
+	// Optional resource-optimization layer. When set, Chat runs the budget +
+	// load-balancer pipeline before dispatch (see chatOptimized).
+	optimizer *optimization.Optimizer
 
 	// savings counters (token/cost saved by cache hits), tracked here because the
 	// gateway is where cached responses are decoded.
@@ -120,6 +134,29 @@ func WithFailover(f *resilience.Failover, providers ProviderResolver) Option {
 		if f != nil && providers != nil {
 			e.failover = f
 			e.providers = providers
+		}
+	}
+}
+
+// WithOptimizer enables the resource-optimization pipeline: before dispatch the
+// gateway runs budget authorization (reject/downgrade) and load-balancer instance
+// selection via the optimizer, then commits actual cost and latency afterward. A
+// nil optimizer is ignored.
+func WithOptimizer(o *optimization.Optimizer) Option {
+	return func(e *Engine) {
+		if o != nil {
+			e.optimizer = o
+		}
+	}
+}
+
+// WithProviderResolver injects the resolver used to reach a provider by name.
+// WithFailover already supplies one; this option lets the optimized dispatch path
+// resolve providers without enabling failover. A nil resolver is ignored.
+func WithProviderResolver(pr ProviderResolver) Option {
+	return func(e *Engine) {
+		if pr != nil {
+			e.providers = pr
 		}
 	}
 }
@@ -175,6 +212,9 @@ type ChatResult struct {
 	// Failover is set in failover dispatch mode, describing which candidates were
 	// skipped/failed and which served the request.
 	Failover *resilience.FailoverOutcome
+	// Optimization is set in optimized dispatch mode, carrying the budget verdict,
+	// any downgrade, and the chosen provider instance.
+	Optimization *optimization.Plan
 }
 
 // Chat resolves a chat request end to end: route to a provider/model, consult the
@@ -193,9 +233,12 @@ func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResul
 
 	var res *ChatResult
 	var err error
-	if e.failover != nil {
+	switch {
+	case e.optimizer != nil:
+		res, err = e.chatOptimized(ctx, req)
+	case e.failover != nil:
 		res, err = e.chatWithFailover(ctx, req)
-	} else {
+	default:
 		res, err = e.chatSimple(ctx, req)
 	}
 
@@ -287,6 +330,101 @@ func (e *Engine) chatSimple(ctx context.Context, req provider.ChatRequest) (*Cha
 	}
 	e.populate(ctx, q, resp)
 	return &ChatResult{Response: resp, Cached: false, Selection: sel}, nil
+}
+
+// chatOptimized runs the resource-optimization pipeline before dispatch: it
+// resolves provider/model/instance (with budget-driven downgrade) via the
+// optimizer, serves from cache when possible, dispatches to the chosen instance,
+// and commits actual cost + latency. A budget rejection returns
+// optimization.ErrBudgetExceeded and never dispatches.
+func (e *Engine) chatOptimized(ctx context.Context, req provider.ChatRequest) (*ChatResult, error) {
+	requestID, _ := tracing.RequestIDFromContext(ctx)
+	scope, id := budgetIdentity(req)
+
+	ostart := time.Now()
+	octx, ospan := e.tracer.Start(ctx, tracing.SpanRoute)
+	plan, err := e.optimizer.Optimize(octx, optimization.OptimizeRequest{
+		Chat:      req,
+		Scope:     scope,
+		BudgetID:  id,
+		RequestID: requestID,
+	})
+	if err != nil {
+		ospan.RecordError(err)
+		ospan.End()
+		return nil, err
+	}
+	ospan.SetAttributes(
+		tracing.String("provider", plan.Provider),
+		tracing.String("model", plan.Model),
+		tracing.String("instance", plan.InstanceID()),
+		tracing.Bool("downgraded", plan.Downgraded),
+	)
+	ospan.End()
+	e.metrics.RoutingDecision(plan.Provider, time.Since(ostart))
+
+	if !plan.Allowed() {
+		return nil, optimization.ErrBudgetExceeded
+	}
+
+	model := plan.Model
+	q := cache.Query{Key: e.keys.ChatKey(model, req), Model: model, Text: renderPrompt(req.Messages)}
+
+	if e.cfg.Enabled {
+		if entry, found := e.lookup(ctx, q); found {
+			var resp provider.ChatResponse
+			if derr := json.Unmarshal(entry.Value, &resp); derr == nil {
+				e.recordHit(resp, model, entry.Level)
+				return &ChatResult{Response: resp, Cached: true, CacheLevel: entry.Level, Similarity: entry.Similarity, Optimization: plan}, nil
+			}
+			e.log.Warn("failed to decode cached response; treating as miss")
+		}
+		e.misses.Add(1)
+		e.metrics.CacheMiss()
+	}
+
+	p, err := e.resolveProvider(plan)
+	if err != nil {
+		return nil, err
+	}
+
+	start := time.Now()
+	resp, derr := e.dispatch(ctx, p, plan.Provider, model, withModel(req, model))
+	latency := time.Since(start)
+	// Commit closes the loop: actual cost to the budget (on success), observed
+	// latency to the load balancer. It never fails the produced response.
+	if cerr := e.optimizer.Commit(ctx, plan, resp.Usage, latency, derr == nil); cerr != nil {
+		e.log.Warn("optimizer commit failed", logger.Err(cerr))
+	}
+	if derr != nil {
+		return nil, derr
+	}
+
+	if e.cfg.Enabled {
+		e.populate(ctx, q, resp)
+	}
+	return &ChatResult{Response: resp, Cached: false, Optimization: plan}, nil
+}
+
+// resolveProvider returns the concrete provider for a plan: the chosen instance's
+// client when present, otherwise the named provider via the resolver.
+func (e *Engine) resolveProvider(plan *optimization.Plan) (provider.LLMProvider, error) {
+	if c := plan.Client(); c != nil {
+		return c, nil
+	}
+	if e.providers == nil {
+		return nil, fmt.Errorf("gateway: no provider resolver for %q (wire WithProviderResolver or instance clients)", plan.Provider)
+	}
+	return e.providers.GetProvider(plan.Provider)
+}
+
+// budgetIdentity extracts the budget scope and ID from request metadata.
+func budgetIdentity(req provider.ChatRequest) (budget.Scope, string) {
+	scope := budget.ScopeUser
+	if req.Metadata[MetaBudgetScope] == string(budget.ScopeTeam) {
+		scope = budget.ScopeTeam
+	}
+	return scope, req.Metadata[MetaBudgetID]
 }
 
 // routingContext builds a routing context carrying the correlation ID from ctx.

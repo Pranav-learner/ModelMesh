@@ -15,6 +15,9 @@ type fakeSource struct {
 	providers []string
 	models    map[string][]provider.ModelInfo
 	err       error
+	// missing lists provider names that GetProvider should reject, to simulate a
+	// validation failure without affecting enumeration.
+	missing map[string]bool
 }
 
 func (f fakeSource) ListProviders() []string { return f.providers }
@@ -24,6 +27,18 @@ func (f fakeSource) ListModels(_ context.Context, name string) ([]provider.Model
 		return nil, f.err
 	}
 	return f.models[name], nil
+}
+
+func (f fakeSource) GetProvider(name string) (provider.LLMProvider, error) {
+	if f.missing[name] {
+		return nil, provider.NewError(name, "lookup", provider.ErrProviderNotFound)
+	}
+	for _, p := range f.providers {
+		if p == name {
+			return mock.New(mock.WithName(name)), nil
+		}
+	}
+	return nil, provider.NewError(name, "lookup", provider.ErrProviderNotFound)
 }
 
 func chatModel(id string) provider.ModelInfo {

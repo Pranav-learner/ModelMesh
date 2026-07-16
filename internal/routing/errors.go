@@ -19,4 +19,8 @@ var (
 
 	// ErrInvalidRoutingConfig indicates a structurally invalid routing config.
 	ErrInvalidRoutingConfig = errors.New("invalid routing config")
+
+	// ErrNoValidProvider indicates that candidates were ranked but every one
+	// failed provider validation, so none could be selected (even after fallback).
+	ErrNoValidProvider = errors.New("no valid provider after fallback")
 )

@@ -1,6 +1,10 @@
 package routing
 
-import "github.com/symbiotes/modelmesh/internal/provider"
+import (
+	"strings"
+
+	"github.com/symbiotes/modelmesh/internal/provider"
+)
 
 // This file defines the routing DTOs. They are provider-agnostic and carry only
 // what a routing decision needs — never a provider SDK type.
@@ -72,17 +76,55 @@ type RoutingContext struct {
 	Attributes map[string]any `json:"attributes,omitempty"`
 	// RequestID correlates the decision with logs and (later) traces.
 	RequestID string `json:"request_id,omitempty"`
+	// Summary is an optional short, provider-agnostic description of the request
+	// (e.g. a truncated prompt) used only for decision logging. The router never
+	// makes decisions from it.
+	Summary string `json:"summary,omitempty"`
 }
 
+// promptSummaryMaxLen bounds the auto-generated prompt summary length.
+const promptSummaryMaxLen = 80
+
 // ChatContext builds a RoutingContext for a chat request, carrying the requested
-// model preference through to the router.
+// model preference and a truncated prompt summary (for logging) through to the
+// router.
 func ChatContext(req provider.ChatRequest) RoutingContext {
-	return RoutingContext{Capability: provider.CapabilityChat, Model: req.Model}
+	return RoutingContext{
+		Capability: provider.CapabilityChat,
+		Model:      req.Model,
+		Summary:    summarize(lastUserContent(req.Messages)),
+	}
 }
 
 // EmbeddingContext builds a RoutingContext for an embeddings request.
 func EmbeddingContext(req provider.EmbeddingRequest) RoutingContext {
-	return RoutingContext{Capability: provider.CapabilityEmbeddings, Model: req.Model}
+	var first string
+	if len(req.Input) > 0 {
+		first = req.Input[0]
+	}
+	return RoutingContext{
+		Capability: provider.CapabilityEmbeddings,
+		Model:      req.Model,
+		Summary:    summarize(first),
+	}
+}
+
+func lastUserContent(msgs []provider.ChatMessage) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == provider.RoleUser {
+			return msgs[i].Content
+		}
+	}
+	return ""
+}
+
+// summarize truncates s to a bounded, single-line summary for logging.
+func summarize(s string) string {
+	s = strings.ReplaceAll(strings.TrimSpace(s), "\n", " ")
+	if len(s) <= promptSummaryMaxLen {
+		return s
+	}
+	return s[:promptSummaryMaxLen] + "…"
 }
 
 // RoutingDecision is the outcome of routing: the selected candidate, the full

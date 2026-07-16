@@ -120,7 +120,14 @@ func (s *WeightedStrategy) Rank(ctx context.Context, rc RoutingContext, candidat
 		return nil, nil
 	}
 
-	breakdowns, err := aggregate(ctx, rc, candidates, s.scorers, s.normWeights)
+	// Adaptive, request-aware weighting: when the routing context carries a
+	// factor-weight override, score with it instead of the static weights.
+	normWeights := s.normWeights
+	if override, ok := factorWeightsOverride(rc); ok {
+		normWeights = normalizeWeights(mergeWeights(s.weights, override))
+	}
+
+	breakdowns, err := aggregate(ctx, rc, candidates, s.scorers, normWeights)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +139,7 @@ func (s *WeightedStrategy) Rank(ctx context.Context, rc RoutingContext, candidat
 		return s.tieBreakLess(breakdowns[i].Candidate, breakdowns[j].Candidate)
 	})
 
-	reasons := s.reasons(breakdowns)
+	reasons := s.reasons(breakdowns, normWeights)
 	out := make([]Candidate, len(breakdowns))
 	for i, b := range breakdowns {
 		c := b.Candidate
@@ -187,7 +194,7 @@ func (s *WeightedStrategy) providerWeight(name string) float64 {
 // reasons builds a human-readable reason per ranked candidate. The winner's
 // reason explains the deciding factor against the runner-up; others state their
 // rank and final score.
-func (s *WeightedStrategy) reasons(ranked []Breakdown) []string {
+func (s *WeightedStrategy) reasons(ranked []Breakdown, weights map[string]float64) []string {
 	out := make([]string, len(ranked))
 	for i, b := range ranked {
 		out[i] = fmt.Sprintf("rank %d of %d (final %.3f)", i+1, len(ranked), b.Final)
@@ -196,7 +203,7 @@ func (s *WeightedStrategy) reasons(ranked []Breakdown) []string {
 	case len(ranked) == 1:
 		out[0] = "only eligible candidate"
 	case len(ranked) >= 2:
-		out[0] = s.winnerReason(ranked[0], ranked[1])
+		out[0] = s.winnerReason(ranked[0], ranked[1], weights)
 	}
 	return out
 }
@@ -205,12 +212,12 @@ func (s *WeightedStrategy) reasons(ranked []Breakdown) []string {
 // largest positive weighted contribution difference decided it, and any factor
 // where the winner was weaker is noted for nuance. Factor iteration is over
 // sorted names, so the reason is deterministic.
-func (s *WeightedStrategy) winnerReason(winner, runner Breakdown) string {
+func (s *WeightedStrategy) winnerReason(winner, runner Breakdown, weights map[string]float64) string {
 	var bestFactor, weakFactor string
 	bestDelta, weakDelta := 0.0, 0.0
 
-	for _, name := range sortedKeys(s.normWeights) {
-		delta := s.normWeights[name] * (winner.Factors[name] - runner.Factors[name])
+	for _, name := range sortedKeys(weights) {
+		delta := weights[name] * (winner.Factors[name] - runner.Factors[name])
 		if delta > bestDelta {
 			bestDelta, bestFactor = delta, name
 		}
@@ -246,4 +253,42 @@ func indexOf(list []string, value string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// factorWeightsOverride reads a per-request factor-weight override from the
+// routing context attributes. It accepts a map[string]float64 (the shape
+// FactorWeights.ToMap produces). A non-positive or empty override is ignored.
+func factorWeightsOverride(rc RoutingContext) (map[string]float64, bool) {
+	if rc.Attributes == nil {
+		return nil, false
+	}
+	raw, ok := rc.Attributes[AttrFactorWeights].(map[string]float64)
+	if !ok || len(raw) == 0 {
+		return nil, false
+	}
+	var sum float64
+	for _, v := range raw {
+		if v > 0 {
+			sum += v
+		}
+	}
+	if sum <= 0 {
+		return nil, false
+	}
+	return raw, true
+}
+
+// mergeWeights returns base with the (positive) entries of override applied, so an
+// override may adjust a subset of factors while the rest keep their base weight.
+func mergeWeights(base, override map[string]float64) map[string]float64 {
+	out := make(map[string]float64, len(base))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range override {
+		if v >= 0 {
+			out[k] = v
+		}
+	}
+	return out
 }

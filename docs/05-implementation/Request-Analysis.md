@@ -1,6 +1,6 @@
 # ModelMesh — Request Analysis Framework (Implementation Guide)
 
-**Status:** Implemented (Phase 7 Part 1 — analysis framework; Part 2 — deterministic complexity classifier + rule engine + routing hints; no ML)
+**Status:** Implemented (Phase 7 Part 1 — analysis framework; Part 2 — complexity classifier + rule engine + hints; Part 3 — adaptive, request-aware routing; no ML)
 **Document type:** Implementation Guide
 **Last updated:** 2026-07-16
 **Related:** [Routing Engine](./Routing-Engine.md) · [Resource-Optimization](./Resource-Optimization.md) · [Prompt Complexity Classifier LLD](../03-components/08-prompt-complexity-classifier.md)
@@ -194,14 +194,85 @@ Generated hints: tier=large, reasoning-intensive
 context, so **every request reaches the router with its complexity, hints, and the
 underlying signals** — ready for Part 3 to route on.
 
-## 11. Readiness for Part 3 (Adaptive Routing)
+## 11. Adaptive Routing (Part 3)
 
-- **Hints are on the wire.** `preferred_model_tier`, the sensitivity flags, and
-  `complexity` ride `RoutingContext.Attributes` today; Part 3 adds routing rules /
-  scorers that read them — no analysis change.
-- **Tiers are provider-agnostic.** The classifier recommends a tier, not a model,
-  so Part 3 owns the tier→model mapping (per provider/config) cleanly.
-- **Confidence is available** for adaptive strategies that want to fall back to
-  cost/latency scoring when a classification is borderline.
-- **Everything is configurable and deterministic**, so adaptive routing can be
-  tuned and A/B-compared without retraining anything.
+The analysis signals now **adapt the routing decision**. Two additive seams
+connect analysis to routing without coupling them:
+
+**Routing seam (`internal/routing`).** The weighted strategy reads an optional
+per-request factor-weight override from `RoutingContext.Attributes`
+(`AttrFactorWeights`, a `map[string]float64`). When present it scores with those
+weights instead of its static ones — the same mechanism it already uses to read
+token estimates. Absent → static behavior, unchanged. `FactorWeights.ToMap()`
+bridges the two.
+
+**Adaptive policy (`internal/adaptive`).** The `Weigher` maps analysis hints to a
+per-request `FactorWeights`, deterministically and explainably:
+
+| Signal | Weight change |
+|--------|---------------|
+| Simple | +cost, −quality |
+| Complex | +quality, −cost |
+| Latency-sensitive | +latency |
+| Cost-sensitive | +cost |
+| High-context | +quality |
+| Reasoning-intensive | +quality |
+
+Every factor is clamped to a configurable floor; every change records factor,
+before/after, and reason. All magnitudes live in `adaptive.Config` (the adjustment
+strategy is fully configurable).
+
+**Composition (`gateway`).** `WithAdaptiveWeighting(weigher)` (alongside
+`WithAnalyzer`) runs analysis → `Weigher.Adapt(hints)` → injects
+`AttrFactorWeights` into the routing context, and records routing accuracy after
+the decision. The result is on `ChatResult.Adaptive`. Net effect:
+
+```
+Application → Request Analysis Engine → Adaptive Router → Provider
+  simple prompt  → +cost weight  → cheapest model wins  (e.g. gpt-4o-mini)
+  complex prompt → +quality weight → best model wins     (e.g. claude-sonnet)
+```
+
+### Diagnostics
+
+`adaptive.ExplainClassification` (re-exports `AnalysisResult.Explain()`),
+`ExplainRoutingHints`, `ExplainAdaptiveWeighting` (base vs adjusted + reasons), and
+`ShowRoutingDecision` (selected candidate, score, deciding reason, ranked field).
+`cmd/adaptiveroutingdemo` prints all four per request.
+
+### Metrics
+
+`adaptive.Metrics` (Nop default) + the in-memory `Collector`/`Snapshot` track
+**classification distribution**, **average complexity**, **hint usage**, **adaptive
+weight changes**, and **routing accuracy** (chosen model's tier vs recommended tier,
+via `Config.ModelTiers`).
+
+### Configuration
+
+- **Classifier**: `ClassifierConfig` (rule set + thresholds), `HintConfig` (tier
+  mapping, reasoning provider/threshold).
+- **Adaptive**: `adaptive.Config` (base weights, per-signal deltas, min-weight
+  floor, model→tier map).
+- **Routing**: unchanged `WeightedConfig` (the base weights adaptation adjusts).
+
+### Extension Guide (adaptive)
+
+- **Tune the policy** — adjust `adaptive.Config` deltas/floor; no code change.
+- **New signal → weight** — add a hint (Part 2), then a branch in `Weigher.Adapt`
+  mapping it to a factor delta.
+- **New adaptation target** — a factor beyond cost/latency/availability/quality is
+  a new routing `Scorer` (`WithScorer`) plus a delta in the weigher.
+- **Bridge metrics** — implement `adaptive.Metrics` against `internal/metrics`.
+
+## 12. Readiness for Phase 8 (Shadow Traffic & Evaluation)
+
+- **Every decision is fully explained and structured** (`ChatResult.Analysis` +
+  `.Adaptive` + `.Selection.Decision`), so a shadow/candidate decision can be
+  captured and diffed against the primary without re-deriving anything.
+- **Routing accuracy is already a metric** — the evaluation platform generalizes
+  this into scored comparisons across strategies.
+- **The weight override is a clean A/B seam** — shadow traffic can score the same
+  request under alternative `FactorWeights` (or a different `Weigher` config) by
+  swapping the injected override, with no routing change.
+- **Deterministic + config-driven** end to end, so shadow vs primary differences
+  are attributable to configuration, not randomness.

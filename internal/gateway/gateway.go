@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/symbiotes/modelmesh/internal/adaptive"
 	"github.com/symbiotes/modelmesh/internal/analysis"
 	"github.com/symbiotes/modelmesh/internal/budget"
 	"github.com/symbiotes/modelmesh/internal/cache"
@@ -90,6 +91,11 @@ type Engine struct {
 	// Optional request-analysis layer. When set, every request is analyzed at
 	// entry and its routing hints enrich the routing context.
 	analyzer analysis.Analyzer
+
+	// Optional adaptive-weighting layer. When set alongside the analyzer, request
+	// analysis is turned into a per-request factor-weight override that adapts the
+	// routing decision (request-aware routing).
+	weigher *adaptive.Weigher
 
 	// savings counters (token/cost saved by cache hits), tracked here because the
 	// gateway is where cached responses are decoded.
@@ -167,6 +173,18 @@ func WithAnalyzer(a analysis.Analyzer) Option {
 	}
 }
 
+// WithAdaptiveWeighting enables request-aware routing: alongside the analyzer, the
+// gateway maps each request's complexity and hints to per-request scoring-factor
+// weights (via the weigher) and injects them into the routing context. A nil
+// weigher is ignored. Requires WithAnalyzer to have any effect.
+func WithAdaptiveWeighting(w *adaptive.Weigher) Option {
+	return func(e *Engine) {
+		if w != nil {
+			e.weigher = w
+		}
+	}
+}
+
 // WithProviderResolver injects the resolver used to reach a provider by name.
 // WithFailover already supplies one; this option lets the optimized dispatch path
 // resolve providers without enabling failover. A nil resolver is ignored.
@@ -235,6 +253,9 @@ type ChatResult struct {
 	// Analysis is set when the analyzer is enabled, carrying the structured
 	// request analysis produced before routing.
 	Analysis *analysis.AnalysisResult
+	// Adaptive is set when adaptive weighting is enabled, carrying the per-request
+	// factor-weight adaptation applied to the routing decision.
+	Adaptive *adaptive.Result
 }
 
 // Chat resolves a chat request end to end: route to a provider/model, consult the
@@ -251,13 +272,21 @@ func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResul
 	defer span.End()
 	start := time.Now()
 
-	// Request analysis runs before routing: it produces a structured result and
-	// carries it on the context so routing-context construction can enrich itself.
+	// Request analysis runs before routing: it produces a structured result whose
+	// hints (and any adaptive factor-weight override) are carried on the context so
+	// routing-context construction can enrich itself.
 	var analysisResult *analysis.AnalysisResult
+	var adaptiveResult *adaptive.Result
 	if e.analyzer != nil {
 		r := e.analyzer.Analyze(ctx, req)
 		analysisResult = &r
-		ctx = analysis.NewContext(ctx, r)
+		attrs := r.Attributes()
+		if e.weigher != nil {
+			ad := e.weigher.Adapt(r.Hints)
+			adaptiveResult = &ad
+			attrs[routing.AttrFactorWeights] = ad.Adjusted.ToMap()
+		}
+		ctx = withEnrichment(ctx, attrs)
 	}
 
 	var res *ChatResult
@@ -300,8 +329,25 @@ func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResul
 		fields = append(fields, logger.Bool("failover", res.Failover.FailoverUsed))
 	}
 	res.Analysis = analysisResult
+	res.Adaptive = adaptiveResult
+	// Score routing accuracy: did the routed model's tier match the recommendation?
+	if e.weigher != nil && analysisResult != nil {
+		e.weigher.RecordOutcome(analysisResult.Hints.PreferredModelTier, chosenModel(res))
+	}
 	log.Info("request completed", fields...)
 	return res, nil
+}
+
+// chosenModel returns the model the request was routed to: the routing decision's
+// selected model when available, otherwise the served response's model.
+func chosenModel(res *ChatResult) string {
+	if res.Selection != nil {
+		return res.Selection.Selected.Model
+	}
+	if res.Optimization != nil {
+		return res.Optimization.Model
+	}
+	return res.Response.Model
 }
 
 // chatSimple dispatches to the single selected provider (no failover).
@@ -372,8 +418,8 @@ func (e *Engine) chatOptimized(ctx context.Context, req provider.ChatRequest) (*
 	scope, id := budgetIdentity(req)
 
 	var analysisAttrs map[string]any
-	if ar, ok := analysis.FromContext(ctx); ok {
-		analysisAttrs = ar.Attributes()
+	if attrs, ok := enrichmentFromContext(ctx); ok {
+		analysisAttrs = attrs
 	}
 
 	ostart := time.Now()
@@ -470,8 +516,8 @@ func (e *Engine) routingContext(ctx context.Context, req provider.ChatRequest) r
 	if id, ok := tracing.RequestIDFromContext(ctx); ok {
 		rc.RequestID = id
 	}
-	if ar, ok := analysis.FromContext(ctx); ok {
-		rc.Attributes = mergeAttributes(rc.Attributes, ar.Attributes())
+	if attrs, ok := enrichmentFromContext(ctx); ok {
+		rc.Attributes = mergeAttributes(rc.Attributes, attrs)
 	}
 	return rc
 }
@@ -491,6 +537,22 @@ func mergeAttributes(base, extra map[string]any) map[string]any {
 		}
 	}
 	return base
+}
+
+// enrichmentKey is the private context key for the routing-enrichment attributes
+// (analysis hints + any adaptive factor-weight override) computed once per request.
+type enrichmentKey struct{}
+
+// withEnrichment carries the routing-enrichment attributes on the context so both
+// the simple/failover routing-context builder and the optimized path can apply
+// them without re-running analysis.
+func withEnrichment(ctx context.Context, attrs map[string]any) context.Context {
+	return context.WithValue(ctx, enrichmentKey{}, attrs)
+}
+
+func enrichmentFromContext(ctx context.Context) (map[string]any, bool) {
+	attrs, ok := ctx.Value(enrichmentKey{}).(map[string]any)
+	return attrs, ok
 }
 
 // lookup performs a traced cache lookup, returning the entry and whether it hit.

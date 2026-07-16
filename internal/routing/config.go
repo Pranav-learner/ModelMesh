@@ -65,6 +65,12 @@ var DefaultExpectedLatency = 800 * time.Millisecond
 const (
 	AttrEstimatedInputTokens  = "estimated_input_tokens"
 	AttrEstimatedOutputTokens = "estimated_output_tokens"
+	// AttrFactorWeights carries a per-request factor-weight override
+	// (map[string]float64 keyed by scorer name) used for adaptive, request-aware
+	// routing. When present on RoutingContext.Attributes, the weighted strategy
+	// scores with these weights instead of its static ones. Absent → static
+	// behavior, unchanged.
+	AttrFactorWeights = "factor_weights"
 )
 
 // FactorWeights are the weights applied to each scoring factor when combining
@@ -78,6 +84,18 @@ type FactorWeights struct {
 }
 
 func (f FactorWeights) total() float64 { return f.Cost + f.Latency + f.Availability + f.Quality }
+
+// ToMap projects the factor weights onto the scorer-name-keyed map the weighted
+// strategy scores with. It is the bridge the adaptive layer uses to publish
+// per-request weights via AttrFactorWeights.
+func (f FactorWeights) ToMap() map[string]float64 {
+	return map[string]float64{
+		ScorerCost:         f.Cost,
+		ScorerLatency:      f.Latency,
+		ScorerAvailability: f.Availability,
+		ScorerQuality:      f.Quality,
+	}
+}
 
 // ModelPricing is the per-1K-token price of a model, used to estimate cost.
 type ModelPricing struct {

@@ -24,13 +24,16 @@ import (
 	"github.com/symbiotes/modelmesh/internal/cache"
 	"github.com/symbiotes/modelmesh/internal/logger"
 	"github.com/symbiotes/modelmesh/internal/provider"
+	"github.com/symbiotes/modelmesh/internal/resilience"
 	"github.com/symbiotes/modelmesh/internal/routing"
 )
 
 // Router is the narrow view of the Routing Engine the gateway needs.
-// *routing.Manager satisfies it.
+// *routing.Manager satisfies it. Select is used for simple (non-failover)
+// dispatch; Route provides the ordered candidate list for failover.
 type Router interface {
 	Select(ctx context.Context, rc routing.RoutingContext) (*routing.Selection, error)
+	Route(ctx context.Context, rc routing.RoutingContext) (routing.RoutingDecision, error)
 }
 
 // Cache is the narrow multi-level view the gateway needs. *cache.Manager
@@ -38,6 +41,12 @@ type Router interface {
 type Cache interface {
 	Lookup(ctx context.Context, q cache.Query) (cache.Entry, bool, error)
 	Store(ctx context.Context, q cache.Query, value []byte, ttl time.Duration) error
+}
+
+// ProviderResolver resolves a provider name to its LLMProvider, used by failover
+// dispatch to reach each candidate. *provider.Manager satisfies it.
+type ProviderResolver interface {
+	GetProvider(name string) (provider.LLMProvider, error)
 }
 
 // CostEstimator returns the estimated USD cost of a request given its model and
@@ -53,6 +62,11 @@ type Engine struct {
 	cfg    cache.Config
 	log    logger.Logger
 	cost   CostEstimator
+
+	// Optional resilience layer. When both are set, Chat dispatches with
+	// breaker-guarded automatic failover across the routing candidate list.
+	failover  *resilience.Failover
+	providers ProviderResolver
 
 	// savings counters (token/cost saved by cache hits), tracked here because the
 	// gateway is where cached responses are decoded.
@@ -93,6 +107,19 @@ func WithCostEstimator(est CostEstimator) Option {
 	}
 }
 
+// WithFailover enables resilient dispatch: the gateway routes to the ordered
+// candidate list and dispatches through the failover executor, skipping
+// providers with open circuits and failing over on error. Both arguments are
+// required to enable the mode.
+func WithFailover(f *resilience.Failover, providers ProviderResolver) Option {
+	return func(e *Engine) {
+		if f != nil && providers != nil {
+			e.failover = f
+			e.providers = providers
+		}
+	}
+}
+
 // New constructs a gateway Engine over a router and cache.
 func New(router Router, c Cache, cfg cache.Config, opts ...Option) *Engine {
 	e := &Engine{
@@ -117,15 +144,28 @@ type ChatResult struct {
 	CacheLevel string
 	// Similarity is the cosine similarity of a semantic (L3) hit; 0 otherwise.
 	Similarity float64
-	Selection  *routing.Selection
+	// Selection is set in simple (non-failover) dispatch mode.
+	Selection *routing.Selection
+	// Failover is set in failover dispatch mode, describing which candidates were
+	// skipped/failed and which served the request.
+	Failover *resilience.FailoverOutcome
 }
 
 // Chat resolves a chat request end to end: route to a provider/model, consult the
-// multi-level cache, and on a miss dispatch and populate. The caller cannot tell
-// whether the response came from cache or the provider except via the metadata.
+// multi-level cache, and on a miss dispatch and populate. When resilient dispatch
+// is enabled (WithFailover) it dispatches through the failover executor; otherwise
+// it uses the single selected provider. The caller cannot tell whether the
+// response came from cache or the provider except via the metadata.
 func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResult, error) {
 	e.requests.Add(1)
+	if e.failover != nil {
+		return e.chatWithFailover(ctx, req)
+	}
+	return e.chatSimple(ctx, req)
+}
 
+// chatSimple dispatches to the single selected provider (no failover).
+func (e *Engine) chatSimple(ctx context.Context, req provider.ChatRequest) (*ChatResult, error) {
 	sel, err := e.router.Select(ctx, routing.ChatContext(req))
 	if err != nil {
 		return nil, err
@@ -174,6 +214,75 @@ func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResul
 	}
 
 	return &ChatResult{Response: resp, Cached: false, Selection: sel}, nil
+}
+
+// chatWithFailover dispatches with breaker-guarded automatic failover across the
+// routing candidate list. It routes first (so the cache key uses the intended,
+// top-ranked model), consults the cache, and on a miss tries candidates in rank
+// order through the failover executor: providers with open circuits are skipped,
+// and a failing provider fails over to the next. The response is cached under the
+// intended key regardless of which provider ultimately served it.
+func (e *Engine) chatWithFailover(ctx context.Context, req provider.ChatRequest) (*ChatResult, error) {
+	decision, err := e.router.Route(ctx, routing.ChatContext(req))
+	if err != nil {
+		return nil, err
+	}
+	topModel := decision.Selected.Model
+	q := cache.Query{Key: e.keys.ChatKey(topModel, req), Model: topModel, Text: renderPrompt(req.Messages)}
+
+	if e.cfg.Enabled {
+		if entry, found, gerr := e.cache.Lookup(ctx, q); gerr == nil && found {
+			var resp provider.ChatResponse
+			if err := json.Unmarshal(entry.Value, &resp); err == nil {
+				e.recordHit(resp, topModel, entry.Level)
+				return &ChatResult{Response: resp, Cached: true, CacheLevel: entry.Level, Similarity: entry.Similarity}, nil
+			}
+			e.log.Warn("failed to decode cached response; treating as miss")
+		}
+		e.misses.Add(1)
+	}
+
+	var resp provider.ChatResponse
+	outcome, err := e.failover.Do(ctx, toTargets(decision.Candidates), func(cctx context.Context, tg resilience.Target) error {
+		p, gerr := e.providers.GetProvider(tg.Provider)
+		if gerr != nil {
+			return gerr
+		}
+		r, cerr := p.Chat(cctx, withModel(req, tg.Model))
+		if cerr != nil {
+			return cerr
+		}
+		resp = r
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if e.cfg.Enabled {
+		if value, merr := json.Marshal(resp); merr == nil {
+			if serr := e.cache.Store(ctx, q, value, e.cfg.DefaultTTL); serr != nil {
+				e.log.Warn("cache population failed", logger.Err(serr))
+			}
+		}
+	}
+	return &ChatResult{Response: resp, Cached: false, Failover: &outcome}, nil
+}
+
+// toTargets converts routing candidates to failover targets.
+func toTargets(candidates []routing.Candidate) []resilience.Target {
+	out := make([]resilience.Target, len(candidates))
+	for i, c := range candidates {
+		out[i] = resilience.Target{Provider: c.Provider, Model: c.Model}
+	}
+	return out
+}
+
+// withModel returns a copy of req with the model set (req is passed by value; the
+// Messages slice is shared but never mutated).
+func withModel(req provider.ChatRequest, model string) provider.ChatRequest {
+	req.Model = model
+	return req
 }
 
 // recordHit updates savings counters when a response is served from cache.

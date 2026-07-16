@@ -23,6 +23,10 @@ var (
 
 	// ErrInvalidBreakerConfig indicates a structurally invalid breaker config.
 	ErrInvalidBreakerConfig = errors.New("invalid circuit breaker config")
+
+	// ErrAllProvidersFailed indicates every candidate in a failover attempt was
+	// unavailable (open circuit) or failed.
+	ErrAllProvidersFailed = errors.New("all providers failed or unavailable")
 )
 
 // openRejection is the immutable error returned when a call is rejected by an

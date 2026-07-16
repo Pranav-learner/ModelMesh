@@ -40,6 +40,7 @@ type Manager struct {
 	clock     func() time.Time
 	idgen     func() string
 	sampler   func() float64
+	evaluator Evaluator
 
 	wg sync.WaitGroup // in-flight shadow goroutines
 }
@@ -102,6 +103,17 @@ func WithIDGenerator(gen func() string) Option {
 	}
 }
 
+// WithEvaluator injects the evaluator that receives each completed primary/shadow
+// comparison. A nil evaluator is ignored (no evaluation). It runs on the shadow
+// goroutine, off the primary path.
+func WithEvaluator(e Evaluator) Option {
+	return func(m *Manager) {
+		if e != nil {
+			m.evaluator = e
+		}
+	}
+}
+
 // New constructs a shadow Manager from configuration and a provider source. It
 // validates the config and resolves the policy by name, failing fast.
 func New(cfg Config, providers ProviderSource, opts ...Option) (*Manager, error) {
@@ -145,7 +157,7 @@ func (m *Manager) Policy() string { return m.policy.Name() }
 // asynchronously, and returns the execution handle and true. Otherwise it returns
 // (nil, false). It never blocks on the shadow request and never returns an error —
 // shadowing must not affect the primary path.
-func (m *Manager) Shadow(ctx context.Context, req provider.ChatRequest, primary Target) (*ShadowExecution, bool) {
+func (m *Manager) Shadow(ctx context.Context, req provider.ChatRequest, primary Primary) (*ShadowExecution, bool) {
 	m.tracker.evaluated()
 
 	dec := m.policy.Decide(ctx, req)
@@ -154,10 +166,10 @@ func (m *Manager) Shadow(ctx context.Context, req provider.ChatRequest, primary 
 	}
 	m.tracker.sampled()
 
-	target, ok := m.selector.Select(primary, m.candidates(primary, req))
+	target, ok := m.selector.Select(primary.Target, m.candidates(primary.Target, req))
 	if !ok {
 		m.tracker.skipped()
-		m.log.Debug("shadow: no secondary provider available", logger.String("primary", primary.Provider))
+		m.log.Debug("shadow: no secondary provider available", logger.String("primary", primary.Target.Provider))
 		return nil, false
 	}
 
@@ -166,12 +178,13 @@ func (m *Manager) Shadow(ctx context.Context, req provider.ChatRequest, primary 
 		ShadowRequest{ID: m.idgen(), Request: cloneRequest(req), Target: target},
 		ShadowMetadata{
 			CorrelationID: correlationID(ctx),
-			Primary:       primary,
+			Primary:       primary.Target,
 			Policy:        m.policy.Name(),
 			SampleRate:    dec.Rate,
 			CreatedAt:     m.clock(),
 		},
 	)
+	exec.primary = primary
 
 	m.tracker.dispatched(exec)
 	m.wg.Add(1)
@@ -248,6 +261,19 @@ func (m *Manager) finish(exec *ShadowExecution, result *ShadowResult, start time
 		logger.String("target", exec.Request.Target.Provider),
 		logger.Bool("success", result.Success),
 	)
+
+	// Hand the completed pair to the evaluator (Part 2), off the primary path.
+	if m.evaluator != nil {
+		m.evaluator.Evaluate(context.Background(), Comparison{
+			CorrelationID:   exec.Metadata.CorrelationID,
+			Primary:         exec.primary.Target,
+			Shadow:          exec.Request.Target,
+			PrimaryResponse: exec.primary.Response,
+			PrimaryLatency:  exec.primary.Latency,
+			ShadowResult:    *result,
+			Metadata:        exec.Metadata,
+		})
+	}
 }
 
 // Wait blocks until all in-flight shadow requests have completed. It is used at

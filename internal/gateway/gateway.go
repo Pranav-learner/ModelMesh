@@ -356,7 +356,11 @@ func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResul
 	// fire-and-forget — it never touches res, so the application only ever receives
 	// the primary response.
 	if e.shadow != nil {
-		e.shadow.Shadow(ctx, req, shadow.Target{Provider: res.Response.Provider, Model: chosenModel(res)})
+		e.shadow.Shadow(ctx, req, shadow.Primary{
+			Target:   shadow.Target{Provider: res.Response.Provider, Model: chosenModel(res)},
+			Response: res.Response,
+			Latency:  duration,
+		})
 	}
 	log.Info("request completed", fields...)
 	return res, nil

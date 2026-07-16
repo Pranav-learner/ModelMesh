@@ -56,7 +56,7 @@ func TestManager_DisabledNeverShadows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exec, ok := m.Shadow(context.Background(), chatReq(), shadow.Target{Provider: "openai", Model: "m"})
+	exec, ok := m.Shadow(context.Background(), chatReq(), shadow.Primary{Target: shadow.Target{Provider: "openai", Model: "m"}})
 	if ok || exec != nil {
 		t.Errorf("disabled manager should not shadow")
 	}
@@ -75,7 +75,7 @@ func TestManager_FixedPercentageDispatchesToSecondary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	exec, ok := m.Shadow(context.Background(), chatReq(), shadow.Target{Provider: "openai", Model: "m"})
+	exec, ok := m.Shadow(context.Background(), chatReq(), shadow.Primary{Target: shadow.Target{Provider: "openai", Model: "m"}})
 	if !ok || exec == nil {
 		t.Fatal("expected a shadow to be dispatched")
 	}
@@ -103,7 +103,7 @@ func TestManager_PercentageSuppressed(t *testing.T) {
 		shadow.Config{Policy: shadow.PolicyFixedPercentage, Percentage: 50},
 		pm, shadow.WithSampler(neverSampler),
 	)
-	if _, ok := m.Shadow(context.Background(), chatReq(), shadow.Target{Provider: "openai", Model: "m"}); ok {
+	if _, ok := m.Shadow(context.Background(), chatReq(), shadow.Primary{Target: shadow.Target{Provider: "openai", Model: "m"}}); ok {
 		t.Errorf("neverSampler should suppress a 50%% policy")
 	}
 }
@@ -116,7 +116,7 @@ func TestManager_AsyncExecution(t *testing.T) {
 		pm, shadow.WithSampler(alwaysSampler),
 	)
 
-	exec, ok := m.Shadow(context.Background(), chatReq(), shadow.Target{Provider: "openai", Model: "m"})
+	exec, ok := m.Shadow(context.Background(), chatReq(), shadow.Primary{Target: shadow.Target{Provider: "openai", Model: "m"}})
 	if !ok {
 		t.Fatal("expected dispatch")
 	}
@@ -139,7 +139,7 @@ func TestManager_FailureIsolation_Error(t *testing.T) {
 	)
 
 	// Shadow() never returns an error even though the shadow provider fails.
-	exec, ok := m.Shadow(context.Background(), chatReq(), shadow.Target{Provider: "openai", Model: "m"})
+	exec, ok := m.Shadow(context.Background(), chatReq(), shadow.Primary{Target: shadow.Target{Provider: "openai", Model: "m"}})
 	if !ok {
 		t.Fatal("expected dispatch")
 	}
@@ -160,7 +160,7 @@ func TestManager_FailureIsolation_Panic(t *testing.T) {
 		pm, shadow.WithSampler(alwaysSampler),
 	)
 
-	exec, _ := m.Shadow(context.Background(), chatReq(), shadow.Target{Provider: "openai", Model: "m"})
+	exec, _ := m.Shadow(context.Background(), chatReq(), shadow.Primary{Target: shadow.Target{Provider: "openai", Model: "m"}})
 	m.Wait() // must not crash the test process
 	res := exec.Wait()
 	if res.Success {
@@ -178,7 +178,7 @@ func TestManager_NoSecondaryAvailable(t *testing.T) {
 		shadow.Config{Policy: shadow.PolicyFixedPercentage, Percentage: 100},
 		pm, shadow.WithSampler(alwaysSampler),
 	)
-	if _, ok := m.Shadow(context.Background(), chatReq(), shadow.Target{Provider: "openai", Model: "m"}); ok {
+	if _, ok := m.Shadow(context.Background(), chatReq(), shadow.Primary{Target: shadow.Target{Provider: "openai", Model: "m"}}); ok {
 		t.Errorf("no secondary should yield no shadow")
 	}
 	if s := m.Stats(); s.Sampled != 1 || s.Skipped != 1 || s.Dispatched != 0 {

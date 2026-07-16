@@ -13,6 +13,15 @@ type Target struct {
 	Model    string `json:"model"`
 }
 
+// Primary describes the primary request's outcome, passed to Shadow so the
+// evaluation stage (Part 2) can compare the shadow response against it. The
+// response and latency are used only for evaluation, never re-served.
+type Primary struct {
+	Target   Target
+	Response provider.ChatResponse
+	Latency  time.Duration
+}
+
 // ShadowRequest is a cloned request destined for a secondary provider. The clone
 // is deep with respect to the mutable parts of a ChatRequest, so neither the
 // primary nor the shadow can observe the other's mutations.
@@ -55,6 +64,10 @@ type ShadowExecution struct {
 	ID       string         `json:"id"`
 	Request  ShadowRequest  `json:"request"`
 	Metadata ShadowMetadata `json:"metadata"`
+
+	// primary is the primary outcome to evaluate against; unexported so it is not
+	// serialized and never leaks into the recorded metadata.
+	primary Primary
 
 	mu     sync.Mutex
 	done   chan struct{}

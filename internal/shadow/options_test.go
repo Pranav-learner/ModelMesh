@@ -49,7 +49,7 @@ func TestManager_OptionsWiring(t *testing.T) {
 
 	// Correlation ID is captured from the primary context.
 	ctx := tracing.WithRequestID(context.Background(), "req_primary_123")
-	exec, ok := m.Shadow(ctx, chatReq(), shadow.Target{Provider: "openai", Model: "m"})
+	exec, ok := m.Shadow(ctx, chatReq(), shadow.Primary{Target: shadow.Target{Provider: "openai", Model: "m"}})
 	if !ok {
 		t.Fatal("expected dispatch")
 	}
@@ -81,7 +81,7 @@ func TestManager_WithPolicyOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := m.Shadow(context.Background(), chatReq(), shadow.Target{Provider: "openai"}); ok {
+	if _, ok := m.Shadow(context.Background(), chatReq(), shadow.Primary{Target: shadow.Target{Provider: "openai"}}); ok {
 		t.Errorf("explicit disabled policy should suppress shadowing")
 	}
 }

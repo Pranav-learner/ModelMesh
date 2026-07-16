@@ -28,12 +28,25 @@ var (
 	ErrProviderExists = errors.New("provider already registered")
 
 	// ErrProviderUnavailable indicates a provider is registered but cannot
-	// currently serve requests (e.g. failed health check, or disabled).
+	// currently serve requests (e.g. failed health check, disabled, or the
+	// upstream returned a 5xx).
 	ErrProviderUnavailable = errors.New("provider unavailable")
 
 	// ErrUnsupportedModel indicates the requested model is not offered by the
-	// selected provider.
+	// selected provider (determined locally, before dispatch).
 	ErrUnsupportedModel = errors.New("unsupported model")
+
+	// ErrAuthenticationFailed indicates the provider rejected our credentials
+	// (typically an upstream 401/403).
+	ErrAuthenticationFailed = errors.New("authentication failed")
+
+	// ErrModelNotFound indicates the upstream reported the requested model does
+	// not exist (typically an upstream 404). It is distinct from
+	// ErrUnsupportedModel, which is a local, pre-dispatch determination.
+	ErrModelNotFound = errors.New("model not found")
+
+	// ErrRateLimited indicates the provider throttled the request (upstream 429).
+	ErrRateLimited = errors.New("rate limited")
 
 	// ErrInvalidRequest indicates a structurally invalid request. DTO Validate
 	// methods wrap this error.

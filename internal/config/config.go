@@ -22,19 +22,41 @@ const (
 	DefaultHealthCheckInterval = 30 * time.Second
 )
 
-// ProviderConfig describes a single provider's configuration. It is deliberately
-// minimal in Phase 1: it carries only what the foundation needs. Fields such as
-// credential references, base URLs, and per-provider model maps will be added in
-// Phase 1 Part 2 when concrete adapters exist. The struct is a natural extension
-// point and additive changes here will not break existing callers.
+// ProviderConfig describes a single provider's configuration.
+//
+// Credentials are never hardcoded: APIKey holds a value that the bootstrap layer
+// is expected to source from the environment (or another secret store) rather
+// than from a checked-in file. An empty APIKey is permitted at config level so
+// that tests and the mock provider need no credentials; each adapter decides how
+// to behave when a key is absent.
 type ProviderConfig struct {
-	// Name is the provider identifier, matching LLMProvider.Name().
+	// Name is the provider identifier, matching LLMProvider.Name()
+	// (e.g. "openai", "anthropic").
 	Name string
 	// Enabled allows a configured provider to be turned off without removing it.
 	Enabled bool
+	// APIKey is the provider credential. It should be injected from the
+	// environment by the bootstrap layer, never committed.
+	APIKey string
+	// BaseURL optionally overrides the provider's default API endpoint. Useful
+	// for proxies, gateways, compatible endpoints (e.g. Azure OpenAI), and for
+	// pointing at a local test server. Empty means "use the SDK default".
+	BaseURL string
 	// Timeout optionally overrides the global RequestTimeout for this provider.
 	// A zero value means "inherit the global timeout".
 	Timeout time.Duration
+	// Models optionally overrides the adapter's built-in list of supported model
+	// IDs. Empty means "use the adapter defaults".
+	Models []string
+}
+
+// ResolvedTimeout returns the provider-specific timeout if set, otherwise the
+// supplied global default.
+func (p ProviderConfig) ResolvedTimeout(global time.Duration) time.Duration {
+	if p.Timeout > 0 {
+		return p.Timeout
+	}
+	return global
 }
 
 // Config is the root configuration for ModelMesh. Only the fields relevant to

@@ -187,6 +187,10 @@ const (
 // Breaker and Health Monitor will consume this; the Provider Layer only reports
 // a point-in-time reading.
 type HealthStatus struct {
+	// Provider is the name of the provider this reading is for. It is optional
+	// (the caller already knows which provider it asked) but populated by real
+	// adapters so a HealthStatus is self-describing when passed around.
+	Provider  string        `json:"provider,omitempty"`
 	State     HealthState   `json:"state"`
 	Detail    string        `json:"detail,omitempty"`
 	CheckedAt time.Time     `json:"checked_at"`

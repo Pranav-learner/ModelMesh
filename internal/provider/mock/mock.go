@@ -194,6 +194,7 @@ func (p *Provider) HealthCheck(ctx context.Context) (provider.HealthStatus, erro
 		return provider.HealthStatus{State: provider.HealthStateUnknown}, err
 	}
 	h := p.health
+	h.Provider = p.name
 	h.CheckedAt = p.now()
 	return h, nil
 }

@@ -1,0 +1,13 @@
+# Grafana datasource provisioning — wires the Prometheus that scrapes ModelMesh.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus # referenced by every dashboard panel's datasource
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 10s
+    editable: true

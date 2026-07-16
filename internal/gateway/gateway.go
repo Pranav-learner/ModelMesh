@@ -23,6 +23,7 @@ import (
 
 	"github.com/symbiotes/modelmesh/internal/cache"
 	"github.com/symbiotes/modelmesh/internal/logger"
+	"github.com/symbiotes/modelmesh/internal/metrics"
 	"github.com/symbiotes/modelmesh/internal/provider"
 	"github.com/symbiotes/modelmesh/internal/resilience"
 	"github.com/symbiotes/modelmesh/internal/routing"
@@ -57,13 +58,14 @@ type CostEstimator func(model string, usage provider.Usage) float64
 
 // Engine is the cache-aware routing gateway.
 type Engine struct {
-	router Router
-	cache  Cache
-	keys   cache.KeyGenerator
-	cfg    cache.Config
-	log    logger.Logger
-	cost   CostEstimator
-	tracer tracing.Tracer
+	router  Router
+	cache   Cache
+	keys    cache.KeyGenerator
+	cfg     cache.Config
+	log     logger.Logger
+	cost    CostEstimator
+	tracer  tracing.Tracer
+	metrics metrics.Recorder
 
 	// Optional resilience layer. When both are set, Chat dispatches with
 	// breaker-guarded automatic failover across the routing candidate list.
@@ -132,15 +134,26 @@ func WithTracer(t tracing.Tracer) Option {
 	}
 }
 
+// WithMetrics injects a metrics recorder. A nil recorder is ignored (the default
+// is a no-op recorder).
+func WithMetrics(rec metrics.Recorder) Option {
+	return func(e *Engine) {
+		if rec != nil {
+			e.metrics = rec
+		}
+	}
+}
+
 // New constructs a gateway Engine over a router and cache.
 func New(router Router, c Cache, cfg cache.Config, opts ...Option) *Engine {
 	e := &Engine{
-		router: router,
-		cache:  c,
-		keys:   cache.NewKeyGenerator(),
-		cfg:    cfg.WithDefaults(),
-		log:    logger.Nop(),
-		tracer: tracing.Noop(),
+		router:  router,
+		cache:   c,
+		keys:    cache.NewKeyGenerator(),
+		cfg:     cfg.WithDefaults(),
+		log:     logger.Nop(),
+		tracer:  tracing.Noop(),
+		metrics: metrics.NoOp{},
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -188,6 +201,7 @@ func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResul
 
 	log := tracing.LoggerWith(ctx, e.log)
 	duration := time.Since(start)
+	e.metrics.GatewayRequest(err == nil, duration)
 	if err != nil {
 		span.RecordError(err)
 		log.Error("request failed", logger.Err(err), logger.String("latency", duration.String()))
@@ -219,6 +233,7 @@ func (e *Engine) Chat(ctx context.Context, req provider.ChatRequest) (*ChatResul
 
 // chatSimple dispatches to the single selected provider (no failover).
 func (e *Engine) chatSimple(ctx context.Context, req provider.ChatRequest) (*ChatResult, error) {
+	rstart := time.Now()
 	rctx, rspan := e.tracer.Start(ctx, tracing.SpanRoute)
 	sel, err := e.router.Select(rctx, e.routingContext(ctx, req))
 	if err != nil {
@@ -233,6 +248,7 @@ func (e *Engine) chatSimple(ctx context.Context, req provider.ChatRequest) (*Cha
 		tracing.Float("score", sel.Selected.Score),
 	)
 	rspan.End()
+	e.metrics.RoutingDecision(sel.Selected.Provider, time.Since(rstart))
 
 	if !e.cfg.Enabled {
 		resp, err := e.dispatch(ctx, sel.Provider, sel.Selected.Provider, sel.Selected.Model, req)
@@ -264,6 +280,7 @@ func (e *Engine) chatSimple(ctx context.Context, req provider.ChatRequest) (*Cha
 	}
 
 	e.misses.Add(1)
+	e.metrics.CacheMiss()
 	resp, err := e.dispatch(ctx, sel.Provider, sel.Selected.Provider, sel.Selected.Model, req)
 	if err != nil {
 		return nil, err
@@ -305,12 +322,14 @@ func (e *Engine) populate(ctx context.Context, q cache.Query, resp provider.Chat
 	}
 }
 
-// dispatch performs a traced provider call.
+// dispatch performs a traced, metered provider call.
 func (e *Engine) dispatch(ctx context.Context, p provider.LLMProvider, providerName, model string, req provider.ChatRequest) (provider.ChatResponse, error) {
 	pctx, pspan := e.tracer.Start(ctx, tracing.SpanProviderCall,
 		tracing.String("provider", providerName), tracing.String("model", model))
 	defer pspan.End()
+	start := time.Now()
 	resp, err := p.Chat(pctx, req)
+	e.metrics.ProviderRequest(providerName, err == nil, time.Since(start))
 	if err != nil {
 		pspan.RecordError(err)
 		return provider.ChatResponse{}, err
@@ -326,6 +345,7 @@ func (e *Engine) dispatch(ctx context.Context, p provider.LLMProvider, providerN
 // and a failing provider fails over to the next. The response is cached under the
 // intended key regardless of which provider ultimately served it.
 func (e *Engine) chatWithFailover(ctx context.Context, req provider.ChatRequest) (*ChatResult, error) {
+	rstart := time.Now()
 	rctx, rspan := e.tracer.Start(ctx, tracing.SpanRoute)
 	decision, err := e.router.Route(rctx, e.routingContext(ctx, req))
 	if err != nil {
@@ -340,6 +360,7 @@ func (e *Engine) chatWithFailover(ctx context.Context, req provider.ChatRequest)
 		tracing.Int("candidates", len(decision.Candidates)),
 	)
 	rspan.End()
+	e.metrics.RoutingDecision(decision.Selected.Provider, time.Since(rstart))
 
 	topModel := decision.Selected.Model
 	q := cache.Query{Key: e.keys.ChatKey(topModel, req), Model: topModel, Text: renderPrompt(req.Messages)}
@@ -354,6 +375,7 @@ func (e *Engine) chatWithFailover(ctx context.Context, req provider.ChatRequest)
 			e.log.Warn("failed to decode cached response; treating as miss")
 		}
 		e.misses.Add(1)
+		e.metrics.CacheMiss()
 	}
 
 	dctx, dspan := e.tracer.Start(ctx, tracing.SpanDispatch)
@@ -381,6 +403,9 @@ func (e *Engine) chatWithFailover(ctx context.Context, req provider.ChatRequest)
 		tracing.Int("attempts", len(outcome.Attempts)),
 	)
 	dspan.End()
+	if outcome.FailoverUsed {
+		e.metrics.Failover()
+	}
 
 	if e.cfg.Enabled {
 		e.populate(ctx, q, resp)
@@ -404,13 +429,17 @@ func withModel(req provider.ChatRequest, model string) provider.ChatRequest {
 	return req
 }
 
-// recordHit updates savings counters when a response is served from cache.
+// recordHit updates savings counters and metrics when a response is served from
+// cache.
 func (e *Engine) recordHit(resp provider.ChatResponse, model, level string) {
 	e.hits.Add(1)
 	e.tokensSaved.Add(int64(resp.Usage.TotalTokens))
+	e.metrics.CacheHit(level)
+	e.metrics.AddTokensSaved(resp.Usage.TotalTokens)
 	if e.cost != nil {
 		saved := e.cost(model, resp.Usage)
 		e.costSavedNano.Add(int64(saved * 1e9))
+		e.metrics.AddCostSaved(saved)
 	}
 	e.log.Debug("cache hit",
 		logger.String("level", level),
